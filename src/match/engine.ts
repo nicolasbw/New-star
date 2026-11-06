@@ -63,7 +63,21 @@ export interface Agent {
   celebrate: number;
   jitterX: number;
   jitterY: number;
+  depth: number; // offset inside its line (neutral metres, + = forward)
+  tgtX: number; // smoothed movement target (world)
+  tgtY: number;
+  tgtSprint: boolean;
+  react: number; // reaction delay after a change of possession
+  aiRun: { x: number; y: number; t: number } | null; // tactical run (world coords)
+  supT: number; // support-spot refresh timer
+  supX: number;
+  supY: number;
+  diveT: number;
+  touchAnim: number;
 }
+
+// Tactical identity of each slot: line depth offset, overlap flag.
+const SLOT_DEPTH = [0, 0, 0, 0, 0, -6, 0, 2, -2, 1, -2];
 
 interface PassInfo {
   from: Agent;
@@ -94,6 +108,8 @@ export interface Ball {
   vy: number;
   vz: number;
   spin: number;
+  lead: number; // how far ahead of the dribbler's feet the ball is
+  touchT: number;
   owner: Agent | null;
   lastTouch: Agent | null;
   kickTime: number;
@@ -188,7 +204,7 @@ export class MatchEngine {
   setup: MatchSetup;
   agents: Agent[] = [];
   ball: Ball = {
-    x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, spin: 0,
+    x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, spin: 0, lead: 0.5, touchT: 0,
     owner: null, lastTouch: null, kickTime: 0, pass: null, shot: null,
   };
   phase: Phase = 'kickoff';
@@ -230,6 +246,8 @@ export class MatchEngine {
   private epoch = 0;
   private scheduled: Array<{ at: number; epoch: number; fn: () => void }> = [];
   private chasers: [Agent | null, Agent | null] = [null, null];
+  private supporters: [Agent[], Agent[]] = [[], []];
+  private runTimer: [number, number] = [2, 2];
   private pressers: [Agent[], Agent[]] = [[], []];
   benchUser: { slot: number } | null = null;
   dbg = { passes: 0, tackleAtt: 0, tackleOk: 0, intercepts: 0, interceptRolls: 0, shots: 0 };
@@ -268,6 +286,17 @@ export class MatchEngine {
           celebrate: 0,
           jitterX: rand(-1.5, 1.5),
           jitterY: rand(-1.5, 1.5),
+          depth: SLOT_DEPTH[i],
+          tgtX: 0,
+          tgtY: 0,
+          tgtSprint: false,
+          react: 0,
+          aiRun: null,
+          supT: 0,
+          supX: 0,
+          supY: 0,
+          diveT: 0,
+          touchAnim: 0,
         });
       });
     }
@@ -352,8 +381,11 @@ export class MatchEngine {
     a.attrs = { ...s.attrs };
     a.name = s.name.split(' ').slice(-1)[0];
     a.num = s.number;
-    if (s.position === 'CAM') a.bx += 5;
-    if (s.position === 'CDM') a.bx -= 1;
+    if (s.position === 'CAM') {
+      a.bx += 5;
+      a.depth += 5;
+    }
+    if (s.position === 'CDM') a.depth -= 1;
     this.user = a;
     this.userOnField = true;
   }
@@ -388,10 +420,18 @@ export class MatchEngine {
       a.celebrate = 0;
       a.dive = 0;
       a.dir = a.team === 0 ? 0 : Math.PI;
+      a.tgtX = a.x;
+      a.tgtY = a.y;
+      a.aiRun = null;
+      a.react = 0;
     }
     const st = this.teamOf(team).find((a) => FORMATION[a.slot].key === 'ST') ?? this.teamOf(team)[9];
     this.giveBall(st, true);
     st.decideCd = 99;
+    const b = this.ball;
+    b.x = st.x + Math.cos(st.dir) * 0.5;
+    b.y = st.y;
+    b.z = 0;
   }
 
   restart(kind: 'throw' | 'corner' | 'goalkick' | 'freekick', team: 0 | 1, x: number, y: number) {
@@ -443,11 +483,19 @@ export class MatchEngine {
     b.lastTouch = a;
     b.pass = null;
     b.shot = null;
-    b.z = 0;
     b.vx = b.vy = b.vz = 0;
+    b.lead = 0.5;
+    b.touchT = 0.25;
     a.holdTime = 0;
     a.decideCd = rand(0.25, 0.55);
-    if (this.possession !== a.team) this.assistBy = null;
+    if (this.possession !== a.team) {
+      this.assistBy = null;
+      // everybody needs a moment to react to the turnover
+      for (const o of this.agents) {
+        o.react = o === a ? 0 : rand(0.12, 0.42);
+        o.aiRun = null;
+      }
+    }
     this.possession = a.team;
     if (prevPass && prevPass.from.team === a.team && prevPass.from !== a) {
       this.assistBy = prevPass.from;
@@ -643,7 +691,18 @@ export class MatchEngine {
       a.stun = Math.max(0, a.stun - dt);
       a.tackleCd = Math.max(0, a.tackleCd - dt);
       a.kickAnim = Math.max(0, a.kickAnim - dt);
+      a.touchAnim = Math.max(0, a.touchAnim - dt);
       a.celebrate = Math.max(0, a.celebrate - dt);
+      a.react = Math.max(0, a.react - dt);
+      a.supT -= dt;
+      if (a.diveT > 0) {
+        a.diveT -= dt;
+        if (a.diveT <= 0) a.dive = 0;
+      }
+      if (a.aiRun) {
+        a.aiRun.t -= dt;
+        if (a.aiRun.t <= 0) a.aiRun = null;
+      }
       if (a.runTo) {
         a.runTo.t -= dt;
         if (a.runTo.t <= 0) a.runTo = null;
@@ -714,6 +773,7 @@ export class MatchEngine {
     }
 
     this.computeRoles();
+    this.tacticalRuns(dt);
     this.moveAgents(dt);
     this.aiOnBall(dt);
     this.tackles();
@@ -770,7 +830,85 @@ export class MatchEngine {
       this.chasers[team] = best;
       ps.sort((p, q) => p.d - q.d);
       this.pressers[team] = ps.slice(0, 2).map((p) => p.a);
+      // supporters: two nearest teammates offer passing angles to the carrier
+      const c = b.owner;
+      if (c && c.team === team && c.role !== 'GK') {
+        this.supporters[team] = ps
+          .filter((p) => p.a !== c && !p.a.aiRun && !p.a.runTo && p.d < 30 && !(p.a.isUser && this.decision))
+          .sort((p, q) => p.d - (p.a.isUser ? 8 : 0) - (q.d - (q.a.isUser ? 8 : 0)))
+          .slice(0, 2)
+          .map((p) => p.a);
+      } else this.supporters[team] = [];
     }
+  }
+
+  /** Off-the-ball runs: midfielders arriving, full-backs overlapping, strikers running in behind. */
+  private tacticalRuns(dt: number) {
+    const c = this.ball.owner;
+    for (const team of [0, 1] as const) {
+      this.runTimer[team] -= dt;
+      if (this.runTimer[team] > 0) continue;
+      this.runTimer[team] = rand(0.9, 1.6);
+      if (!c || c.team !== team || c.role === 'GK') continue;
+      const cn = this.n(team, c.x, c.y);
+      if (cn.x < -12) continue;
+      const mates = this.teamOf(team).filter((a) => a !== c && !a.isUser && a.role !== 'GK' && a.stun <= 0);
+      if (mates.filter((a) => a.aiRun).length >= 2) continue;
+      const line = this.oppLine(team);
+      const opts: Array<{ a: Agent; x: number; y: number; t: number }> = [];
+      for (const a of mates) {
+        if (a.aiRun) continue;
+        const an = this.n(team, a.x, a.y);
+        if (a.role === 'MID' && a.depth >= 0 && cn.x > 5 && an.x < HL - 20) {
+          // box-to-box midfielder arrives at the edge of the box / half-space
+          opts.push({ a, x: Math.min(HL - 13, Math.max(an.x + 12, cn.x + 6)), y: clamp(a.by * 0.6 + rand(-3, 3), -14, 14), t: 2.6 });
+        }
+        if (a.role === 'DEF' && Math.abs(a.by) > 15 && Math.sign(a.by) === Math.sign(cn.y) && cn.x > -2 && Math.abs(cn.y) > 8) {
+          // full-back overlaps on the ball side
+          opts.push({ a, x: Math.min(HL - 8, cn.x + 13), y: Math.sign(a.by) * (HW - 4), t: 2.4 });
+        }
+        if (a.role === 'FWD' && Math.abs(a.by) < 6 && line < HL - 12 && cn.x > -5) {
+          // striker spins in behind the last line
+          opts.push({ a, x: Math.min(HL - 9, line + 8), y: clamp(an.y + rand(-5, 5), -12, 12), t: 1.8 });
+        }
+        if (a.role === 'FWD' && Math.abs(a.by) > 15 && cn.x > 8 && Math.sign(a.by) !== Math.sign(cn.y)) {
+          // far winger attacks the back post
+          opts.push({ a, x: HL - 9, y: Math.sign(a.by) * 7, t: 2.2 });
+        }
+      }
+      if (!opts.length || Math.random() > 0.55) continue;
+      const o = opts[randi(0, opts.length - 1)];
+      const w = this.n(team, o.x, o.y);
+      o.a.aiRun = { x: w.x, y: w.y, t: o.t };
+    }
+  }
+
+  /** Best open spot around the carrier for a supporting player. */
+  private supportSpot(a: Agent, c: Agent) {
+    if (a.supT > 0) return { x: a.supX, y: a.supY };
+    a.supT = rand(0.5, 0.8);
+    const gx = this.attackGoalX(c.team);
+    const base = Math.atan2(-c.y * 0.25, gx - c.x);
+    const other = this.supporters[a.team].find((s) => s !== a);
+    let best = { x: a.x, y: a.y, s: -1e9 };
+    for (const ang of [-1.05, -0.55, 0.55, 1.05, 2.3, -2.3]) {
+      const r = ang > 2 || ang < -2 ? 9 : 12;
+      const x = clamp(c.x + Math.cos(base + ang) * r, -HL + 3, HL - 3);
+      const y = clamp(c.y + Math.sin(base + ang) * r, -HW + 2, HW - 2);
+      let open = 8;
+      let lane = 4;
+      for (const o of this.agents) {
+        if (o.team === a.team || o.sentOff) continue;
+        open = Math.min(open, dist(o.x, o.y, x, y));
+        lane = Math.min(lane, segDist(o.x, o.y, c.x, c.y, x, y));
+      }
+      let sc = open + lane * 1.4 - dist(a.x, a.y, x, y) * 0.18 + (Math.abs(ang) < 1.2 ? 1.5 : 0);
+      if (other && dist(other.supX, other.supY, x, y) < 7) sc -= 8;
+      if (sc > best.s) best = { x, y, s: sc };
+    }
+    a.supX = best.x;
+    a.supY = best.y;
+    return best;
   }
 
   private target(a: Agent): { x: number; y: number; sprint: boolean } {
@@ -823,15 +961,46 @@ export class MatchEngine {
       return { x: w.x, y: w.y, sprint: false };
     }
 
-    // formation
-    let shift = nb.x * 0.5 + (att ? 9 : -3);
-    let tx = a.bx + shift + a.jitterX;
-    if (att && a.role === 'FWD') tx += 4;
-    if (!att && a.role !== 'FWD') tx = Math.min(tx, nb.x - 2.5);
-    if (att && a.role !== 'DEF' && !(b.owner === a)) tx = Math.min(tx, Math.max(this.oppLine(a.team) + 0.3, nb.x - 4));
-    if (a.role === 'DEF') tx = Math.min(tx, 16);
-    tx = clamp(tx, -HL + 6, HL - 4);
-    let ty = a.by * (att ? 1.12 : 0.82) + nb.y * 0.22 + a.jitterY;
+    // tactical runs and support play (attacking)
+    if (this.phase === 'play' && att) {
+      if (a.aiRun) return { x: a.aiRun.x, y: a.aiRun.y, sprint: true };
+      const c = b.owner;
+      if (c && c !== a && this.supporters[a.team].includes(a)) {
+        const sp = this.supportSpot(a, c);
+        return { x: sp.x, y: sp.y, sprint: dist(a.x, a.y, sp.x, sp.y) > 6 };
+      }
+    }
+
+    // formation: a compact block, each line follows the ball at its own distance
+    const bx = nb.x;
+    let defLine: number;
+    let midLine: number;
+    let fwdLine: number;
+    if (att) {
+      defLine = clamp(bx - 27, -40, 14);
+      midLine = clamp(bx - 7.5, -30, 31);
+      fwdLine = clamp(bx + 8, -10, 46);
+    } else {
+      defLine = clamp(bx - 15, -45, -6);
+      midLine = clamp(bx - 6, -37, 10);
+      fwdLine = clamp(bx + 5, -22, 16);
+    }
+    const lineX = a.role === 'DEF' ? defLine : a.role === 'MID' ? midLine : fwdLine;
+    let tx = lineX + a.depth + a.jitterX * 0.6;
+    const wide = Math.abs(a.by) > 15;
+    // full-backs push up on the ball side
+    if (att && a.role === 'DEF' && wide && Math.sign(a.by) === Math.sign(nb.y || a.by) && bx > -10) tx = Math.max(tx, midLine - 4);
+    // centre-backs hold the line together
+    if (a.role === 'DEF' && !wide) tx = defLine;
+    // attackers stay onside unless making a run
+    if (att && a.role !== 'DEF' && b.owner !== a) tx = Math.min(tx, Math.max(this.oppLine(a.team) - 0.4, bx - 3));
+    // defending: midfield screens in front of the back four, nobody hides behind the ball
+    if (!att && a.role === 'MID') tx = Math.max(Math.min(tx, bx - 3), defLine + 5);
+    if (!att && a.role === 'DEF') tx = Math.min(tx, bx - 2);
+    tx = clamp(tx, -HL + 5, HL - 4);
+    const width = att ? (a.role === 'FWD' && wide ? 1.2 : 1.08) : a.role === 'DEF' ? 0.78 : 0.68;
+    const pull = att ? 0.22 : 0.42;
+    let ty = a.by * width + nb.y * pull + a.jitterY;
     ty = clamp(ty, -HW + 1.5, HW - 1.5);
     if (this.phase === 'restart' && b.owner && b.owner.team !== a.team) {
       const d = dist(a.x, a.y, b.x, b.y);
@@ -877,25 +1046,38 @@ export class MatchEngine {
         ty = a.y;
         speed = 0;
       } else {
-        const t = this.target(a);
-        tx = t.x;
-        ty = t.y;
-        speed = t.sprint ? max : max * 0.62;
+        if (a.react <= 0 || this.phase !== 'play') {
+          const t = this.target(a);
+          const k = 1 - Math.exp(-dt * (t.sprint ? 9 : 3.2));
+          if (dist(a.tgtX, a.tgtY, t.x, t.y) > 25) {
+            a.tgtX = t.x;
+            a.tgtY = t.y;
+          } else {
+            a.tgtX += (t.x - a.tgtX) * k;
+            a.tgtY += (t.y - a.tgtY) * k;
+          }
+          a.tgtSprint = t.sprint;
+        }
+        tx = a.tgtX;
+        ty = a.tgtY;
+        speed = a.tgtSprint ? max : max * 0.6;
       }
       const dx = tx - a.x;
       const dy = ty - a.y;
       const d = Math.hypot(dx, dy);
       let dvx = 0;
       let dvy = 0;
-      if (d > 0.35) {
-        const s = Math.min(speed, d * 2.2);
+      if (d > 0.25) {
+        // arrive: ease off before reaching the spot
+        const s = Math.min(speed, Math.sqrt(2 * 5 * Math.max(0, d - 0.2)));
         dvx = (dx / d) * s;
         dvy = (dy / d) * s;
       }
-      const acc = 13 * dt;
       const ex = dvx - a.vx;
       const ey = dvy - a.vy;
       const el = Math.hypot(ex, ey);
+      const braking = ex * a.vx + ey * a.vy < 0;
+      const acc = (braking ? 11 : 7.5) * dt;
       if (el > acc) {
         a.vx += (ex / el) * acc;
         a.vy += (ey / el) * acc;
@@ -905,15 +1087,20 @@ export class MatchEngine {
       }
       a.x += a.vx * dt;
       a.y += a.vy * dt;
+      // body orientation turns smoothly; defenders close to the ball keep facing it
       const sp = Math.hypot(a.vx, a.vy);
-      if (sp > 0.4) a.dir = Math.atan2(a.vy, a.vx);
-      else if (this.phase !== 'goal') {
-        const want = Math.atan2(b.y - a.y, b.x - a.x);
-        let diff = want - a.dir;
-        while (diff > Math.PI) diff -= Math.PI * 2;
-        while (diff < -Math.PI) diff += Math.PI * 2;
-        a.dir += diff * Math.min(1, dt * 5);
-      }
+      const nearBall = dist(a.x, a.y, b.x, b.y) < 7 && b.owner !== a;
+      let want = a.dir;
+      if (this.phase === 'goal' && a.celebrate > 0) want = a.dir;
+      else if (nearBall && sp < 5 && this.phase !== 'goal') want = Math.atan2(b.y - a.y, b.x - a.x);
+      else if (sp > 0.6) want = Math.atan2(a.vy, a.vx);
+      else if (this.phase !== 'goal') want = Math.atan2(b.y - a.y, b.x - a.x);
+      let diff = want - a.dir;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      const turnRate = (b.owner === a ? 5 : 8) - Math.min(3, sp * 0.3);
+      const maxTurn = turnRate * dt;
+      a.dir += clamp(diff, -maxTurn, maxTurn);
       const lim = b.owner === a ? 0.4 : -1.5;
       a.x = clamp(a.x, -HL - lim - 1, HL + lim + 1);
       a.y = clamp(a.y, -HW - lim - 1, HW + lim + 1);
@@ -1067,14 +1254,32 @@ export class MatchEngine {
     const b = this.ball;
     const o = b.owner;
     if (o) {
-      const off = o.role === 'GK' && this.phase !== 'play' ? 0.3 : 0.55;
-      b.x = o.x + Math.cos(o.dir) * off;
-      b.y = o.y + Math.sin(o.dir) * off;
-      b.z = o.role === 'GK' && this.phase === 'restart' ? 0 : 0;
-      b.vx = o.vx;
-      b.vy = o.vy;
+      const sp = Math.hypot(o.vx, o.vy);
+      const inHands = o.role === 'GK' && (this.phase !== 'play' || o.holdTime < 1.2) && this.n(o.team, o.x, o.y).x < -HL + 16.5;
+      if (!inHands && this.phase === 'play' && sp > 1.2) {
+        // dribbling: push the ball ahead with a touch, then catch up with it
+        b.touchT -= dt;
+        if (b.touchT <= 0) {
+          b.lead = 0.55 + sp * 0.2;
+          b.touchT = clamp(0.72 - sp * 0.05, 0.32, 0.7);
+          o.touchAnim = 0.22;
+        }
+      }
+      b.lead += (0.5 - b.lead) * (1 - Math.exp(-dt * 2.2));
+      const off = inHands ? 0.35 : b.lead;
+      const tx = o.x + Math.cos(o.dir) * off;
+      const ty = o.y + Math.sin(o.dir) * off;
+      const tz = inHands ? 1.05 : 0;
+      const k = 1 - Math.exp(-dt * 16);
+      const px = b.x;
+      const py = b.y;
+      b.x += (tx - b.x) * k;
+      b.y += (ty - b.y) * k;
+      b.z += (tz - b.z) * k;
+      b.vx = (b.x - px) / Math.max(dt, 1e-4);
+      b.vy = (b.y - py) / Math.max(dt, 1e-4);
       b.vz = 0;
-      b.spin = Math.hypot(o.vx, o.vy);
+      b.spin = Math.hypot(b.vx, b.vy);
       return;
     }
     b.x += b.vx * dt;
@@ -1160,7 +1365,7 @@ export class MatchEngine {
     const b = this.ball;
     const shooter = b.shot!.by;
     gk.dive = Math.sign(b.y - gk.y) || 1;
-    setTimeout(() => (gk.dive = 0), 900);
+    gk.diveT = 0.9;
     this.push('feed.save', shooter.isUser ? 'bad' : shooter.team === this.userTeam ? 'bad' : 'good', { name: gk.name });
     if (Math.random() < 0.3) {
       // parry for a corner

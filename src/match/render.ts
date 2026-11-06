@@ -137,12 +137,26 @@ const HAIR = ['#1a1410', '#3b2a1c', '#6b4a2a', '#c9a26a', '#0d0d0d'];
 
 interface PlayerRig {
   root: THREE.Group;
-  body: THREE.Group;
+  body: THREE.Group; // whole body (lean, bob)
+  torso: THREE.Group; // upper body (twist)
   legL: THREE.Group;
   legR: THREE.Group;
+  kneeL: THREE.Group;
+  kneeR: THREE.Group;
   armL: THREE.Group;
   armR: THREE.Group;
+  elbowL: THREE.Group;
+  elbowR: THREE.Group;
   phase: number;
+  // smoothed state for display
+  dx: number;
+  dy: number;
+  pvx: number;
+  pvy: number;
+  accF: number;
+  accL: number;
+  sp: number;
+  idle: number;
 }
 
 function box(w: number, h: number, d: number, mat: THREE.Material, y = 0) {
@@ -163,46 +177,65 @@ function makePlayer(shirt: string, shorts: string, socks: string, num: number, n
   const root = new THREE.Group();
   const body = new THREE.Group();
   root.add(body);
-  body.add(box(0.46, 0.62, 0.27, shirtM, 1.3));
   body.add(box(0.44, 0.26, 0.28, shortsM, 0.9));
+  // upper body pivots at the waist so it can twist against the legs
+  const torso = new THREE.Group();
+  torso.position.y = 1.0;
+  body.add(torso);
+  torso.add(box(0.46, 0.62, 0.27, shirtM, 0.3));
   const head = new THREE.Mesh(new THREE.IcosahedronGeometry(0.135, 1), skinM);
-  head.position.y = 1.77;
+  head.position.y = 0.77;
   head.castShadow = true;
-  body.add(head);
+  torso.add(head);
   const hair = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 6, 0, Math.PI * 2, 0, Math.PI / 2), hairM);
-  hair.position.y = 1.79;
-  body.add(hair);
-  const neck = box(0.1, 0.1, 0.1, skinM, 1.64);
-  body.add(neck);
+  hair.position.y = 0.79;
+  torso.add(hair);
+  torso.add(box(0.1, 0.1, 0.1, skinM, 0.64));
   // number on the back
   const nm = new THREE.Mesh(
     new THREE.PlaneGeometry(0.3, 0.3),
     new THREE.MeshBasicMaterial({ map: numberTexture(num, numColor), transparent: true }),
   );
-  nm.position.set(0, 1.33, -0.141);
+  nm.position.set(0, 0.33, -0.141);
   nm.rotation.y = Math.PI;
-  body.add(nm);
+  torso.add(nm);
 
   const leg = (sx: number) => {
-    const g = new THREE.Group();
-    g.position.set(sx, 0.86, 0);
-    g.add(box(0.15, 0.38, 0.16, skinM, -0.19));
-    g.add(box(0.14, 0.42, 0.15, sockM, -0.6));
-    const shoe = box(0.14, 0.08, 0.26, shoeM, -0.83);
+    const hip = new THREE.Group();
+    hip.position.set(sx, 0.86, 0);
+    hip.add(box(0.15, 0.4, 0.16, skinM, -0.2));
+    const knee = new THREE.Group();
+    knee.position.y = -0.4;
+    hip.add(knee);
+    knee.add(box(0.14, 0.4, 0.15, sockM, -0.2));
+    const shoe = box(0.14, 0.08, 0.26, shoeM, -0.42);
     shoe.position.z = 0.05;
-    g.add(shoe);
-    body.add(g);
-    return g;
+    knee.add(shoe);
+    body.add(hip);
+    return { hip, knee };
   };
   const arm = (sx: number) => {
-    const g = new THREE.Group();
-    g.position.set(sx, 1.55, 0);
-    g.add(box(0.13, 0.26, 0.14, shirtM, -0.12));
-    g.add(box(0.11, 0.34, 0.12, skinM, -0.42));
-    body.add(g);
-    return g;
+    const sh = new THREE.Group();
+    sh.position.set(sx, 0.55, 0);
+    sh.add(box(0.13, 0.27, 0.14, shirtM, -0.13));
+    const el = new THREE.Group();
+    el.position.y = -0.27;
+    sh.add(el);
+    el.add(box(0.11, 0.3, 0.12, skinM, -0.15));
+    torso.add(sh);
+    return { sh, el };
   };
-  return { root, body, legL: leg(-0.11), legR: leg(0.11), armL: arm(-0.3), armR: arm(0.3), phase: Math.random() * 6 };
+  const L = leg(-0.11);
+  const R = leg(0.11);
+  const AL = arm(-0.3);
+  const AR = arm(0.3);
+  return {
+    root, body, torso,
+    legL: L.hip, legR: R.hip, kneeL: L.knee, kneeR: R.knee,
+    armL: AL.sh, armR: AR.sh, elbowL: AL.el, elbowR: AR.el,
+    phase: Math.random() * 6,
+    dx: 0, dy: 0, pvx: 0, pvy: 0, accF: 0, accL: 0, sp: 0, idle: Math.random() * 10,
+  };
 }
 
 function footballMesh() {
@@ -230,6 +263,7 @@ export class MatchRenderer {
   ownerRing: THREE.Mesh;
   camX = 0;
   camZoom = 1;
+  focusZ = 0;
   private disposed = false;
 
   constructor(
@@ -438,51 +472,126 @@ export class MatchRenderer {
     this.camera.updateProjectionMatrix();
   }
 
-  private animateRig(a: Agent, rig: PlayerRig, dt: number) {
-    const sp = Math.hypot(a.vx, a.vy);
+  private animateRig(a: Agent, rig: PlayerRig, dt: number, simDt: number) {
     rig.root.visible = !a.sentOff;
-    rig.root.position.set(a.x, 0, a.y);
+    // position: light smoothing hides tiny corrections, big jumps (restarts) snap
+    if (Math.hypot(a.x - rig.dx, a.y - rig.dy) > 3) {
+      rig.dx = a.x;
+      rig.dy = a.y;
+    } else {
+      const k = 1 - Math.exp(-dt * 30);
+      rig.dx += (a.x - rig.dx) * k;
+      rig.dy += (a.y - rig.dy) * k;
+    }
+    rig.root.position.set(rig.dx, 0, rig.dy);
     rig.root.rotation.y = Math.atan2(Math.cos(a.dir), Math.sin(a.dir));
-    rig.phase += sp * dt * 1.9;
-    const amp = Math.min(1, sp / 7) * 0.75;
-    let lL = Math.sin(rig.phase) * amp;
-    let lR = -lL;
-    let aL = -lL * 0.7;
-    let aR = -lR * 0.7;
-    let armZ = 0;
-    rig.body.rotation.set(Math.min(0.25, sp * 0.025), 0, 0);
-    rig.body.position.y = Math.abs(Math.sin(rig.phase)) * 0.06 * amp;
+
+    // speed and acceleration in the body frame (for leaning)
+    const sp = Math.hypot(a.vx, a.vy);
+    rig.sp += (sp - rig.sp) * (1 - Math.exp(-dt * 10));
+    if (simDt > 1e-5) {
+      const ax = (a.vx - rig.pvx) / simDt;
+      const ay = (a.vy - rig.pvy) / simDt;
+      const fx = Math.cos(a.dir);
+      const fy = Math.sin(a.dir);
+      const f = clampN(ax * fx + ay * fy, -14, 14);
+      const l = clampN(-ax * fy + ay * fx, -14, 14);
+      const k = 1 - Math.exp(-dt * 6);
+      rig.accF += (f - rig.accF) * k;
+      rig.accL += (l - rig.accL) * k;
+    }
+    rig.pvx = a.vx;
+    rig.pvy = a.vy;
+
+    // run cycle: cadence and stride grow with speed
+    const s = rig.sp;
+    const run = Math.min(1, s / 7.5);
+    rig.phase += simDt * (s > 0.3 ? 4.2 + s * 0.95 : 0);
+    rig.idle += simDt;
+    const ph = rig.phase;
+    const stride = 0.25 + run * 0.65;
+    let hipL = Math.sin(ph) * stride * Math.min(1, s / 1.5);
+    let hipR = -hipL;
+    // the knee bends most while the leg swings forward
+    let kneeL = (0.15 + Math.max(0, Math.sin(ph + 1.3)) * (0.5 + run * 1.0)) * Math.min(1, s / 1.2);
+    let kneeR = (0.15 + Math.max(0, Math.sin(ph + 1.3 + Math.PI)) * (0.5 + run * 1.0)) * Math.min(1, s / 1.2);
+    let armL = -hipL * (0.6 + run * 0.4);
+    let armR = -hipR * (0.6 + run * 0.4);
+    let elbow = 0.25 + run * 1.0;
+    let armZ = 0.08;
+    const bob = Math.abs(Math.cos(ph)) * 0.07 * run;
+    let bodyY = bob;
+    let pitch = 0.04 + run * 0.16 + clampN(rig.accF * 0.018, -0.18, 0.22);
+    let roll = clampN(-rig.accL * 0.028, -0.3, 0.3);
+    let twist = -Math.sin(ph) * 0.18 * run;
+
+    // standing: slight knee flex, breathing, weight shift
+    if (s < 0.4) {
+      const br = Math.sin(rig.idle * 1.8);
+      kneeL = kneeR = 0.18;
+      hipL = hipR = -0.08;
+      armL = armR = 0.05 + br * 0.03;
+      elbow = 0.35;
+      bodyY = -0.03 + br * 0.008;
+      roll += Math.sin(rig.idle * 0.7) * 0.025;
+      pitch = 0.08;
+    }
+    // dribble touch: a short tap with the right foot
+    if (a.touchAnim > 0) {
+      const k = a.touchAnim / 0.22;
+      hipR = -0.55 * Math.sin(k * Math.PI);
+      kneeR = 0.25;
+    }
+    // kick: plant, strike through the ball, follow-through
     if (a.kickAnim > 0) {
-      const k = a.kickAnim / 0.35;
-      lR = -1.3 * Math.sin(k * Math.PI);
-      aL = 0.6;
+      const k = 1 - a.kickAnim / 0.35; // 0 -> 1
+      hipR = k < 0.25 ? 0.6 * (k / 0.25) : 0.6 - 2.1 * Math.sin(((k - 0.25) / 0.75) * (Math.PI / 2));
+      kneeR = k < 0.25 ? 1.2 : 1.2 * (1 - (k - 0.25) / 0.75) + 0.1;
+      hipL = -0.15;
+      kneeL = 0.35;
+      armL = -0.9;
+      armR = 0.5;
+      armZ = 0.5;
+      pitch = -0.08 + k * 0.15;
+      twist = 0.25 - k * 0.5;
     }
     if (a.celebrate > 0) {
       armZ = 2.6;
-      rig.body.position.y = Math.abs(Math.sin(performance.now() / 120)) * 0.25;
+      armL = armR = 0;
+      elbow = 0.2;
+      bodyY = Math.abs(Math.sin(rig.idle * 7)) * 0.3;
     }
     if (a.dive) {
-      rig.body.rotation.z = -a.dive * 1.25;
-      rig.body.position.y = 0.35;
+      roll = -a.dive * 1.3;
+      bodyY = 0.45;
       armZ = 2.8;
+      hipL = hipR = -0.3;
     }
-    if (a.stun > 0.4 && sp < 1) rig.body.rotation.x = -0.25;
-    rig.legL.rotation.x = lL;
-    rig.legR.rotation.x = lR;
-    rig.armL.rotation.set(aL, 0, -armZ);
-    rig.armR.rotation.set(aR, 0, armZ);
+    if (a.stun > 0.4 && s < 1.5) pitch = -0.22;
+
+    rig.body.position.y = bodyY;
+    rig.body.rotation.set(pitch, 0, roll);
+    rig.torso.rotation.set(0, twist, 0);
+    rig.legL.rotation.x = hipL;
+    rig.legR.rotation.x = hipR;
+    rig.kneeL.rotation.x = kneeL;
+    rig.kneeR.rotation.x = kneeR;
+    rig.armL.rotation.set(armL, 0, -armZ);
+    rig.armR.rotation.set(armR, 0, armZ);
+    rig.elbowL.rotation.x = -elbow;
+    rig.elbowR.rotation.x = -elbow;
   }
 
-  render(dt: number, focus: 'none' | 'user') {
+  render(dt: number, focus: 'none' | 'user', simDt = dt) {
     if (this.disposed) return;
     const e = this.engine;
-    for (const a of e.agents) this.animateRig(a, this.rigs.get(a.id)!, dt);
+    for (const a of e.agents) this.animateRig(a, this.rigs.get(a.id)!, dt, simDt);
     const b = e.ball;
     this.ball.position.set(b.x, 0.22 + b.z, b.y);
     const sp = Math.hypot(b.vx, b.vy);
     if (sp > 0.1) {
       const axis = new THREE.Vector3(b.vy, 0, -b.vx).normalize();
-      this.ball.rotateOnWorldAxis(axis, (sp * dt) / 0.22);
+      this.ball.rotateOnWorldAxis(axis, (sp * simDt) / 0.22);
     }
 
     const u = e.user;
@@ -498,17 +607,20 @@ export class MatchRenderer {
 
     // broadcast camera
     const wantFocus = focus === 'user' && u;
-    const fx = wantFocus ? u!.x * 0.6 + b.x * 0.4 : b.x;
+    const look = b.owner ? 0.5 : 0.25;
+    const fx = wantFocus ? u!.x * 0.6 + b.x * 0.4 : b.x + clampN(b.vx * look, -8, 8);
     const fz = wantFocus ? u!.y * 0.6 + b.y * 0.4 : b.y;
-    const k = 1 - Math.exp(-dt * (wantFocus ? 3 : 1.8));
+    const k = 1 - Math.exp(-dt * (wantFocus ? 2.6 : 1.5));
     this.camX += (clampN(fx * 0.95, -46, 46) - this.camX) * k;
     this.camZoom += ((wantFocus ? 0.7 : 1) - this.camZoom) * (1 - Math.exp(-dt * 2.5));
     const portrait = this.camera.aspect < 1;
     const dist = (portrait ? 58 : 50) * this.camZoom;
     const height = (portrait ? 38 : 25) * this.camZoom;
-    const lookZ = clampN(fz * 0.4, -14, 14);
+    // while a decision is open, keep the player in the upper half, above the options panel
+    this.focusZ += ((wantFocus ? clampN(fz * 0.9, -26, 28) + (portrait ? 9 : 6) : clampN(fz * 0.4, -14, 14)) - this.focusZ) * (1 - Math.exp(-dt * 3));
+    const lookZ = this.focusZ;
     this.camera.position.set(this.camX, height, lookZ + dist);
-    this.camera.lookAt(this.camX, 0, lookZ + (portrait ? 7 : -2));
+    this.camera.lookAt(this.camX, 0, lookZ + (wantFocus ? 0 : portrait ? 7 : -2));
     this.renderer.render(this.scene, this.camera);
   }
 

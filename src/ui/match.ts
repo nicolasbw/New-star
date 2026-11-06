@@ -42,7 +42,6 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
   const $ = (id: string) => root.querySelector<HTMLElement>(`#${id}`)!;
   const renderer = new MatchRenderer(root.querySelector('.m-canvas')!, engine);
   let speedIdx = 0;
-  let acc = 0;
   let last = performance.now();
   let raf = 0;
   let shownDecision: unknown = null;
@@ -179,16 +178,19 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
     raf = requestAnimationFrame(frame);
     const dt = Math.min(0.1, (now - last) / 1000);
     last = now;
+    let simDt = 0;
     if (!ended) {
-      acc += dt * timeScale();
-      let steps = 0;
-      while (acc >= 1 / 60 && steps < 40) {
-        engine.step(1 / 60);
-        acc -= 1 / 60;
-        steps++;
+      // variable step: the simulation advances every frame (smooth slow motion),
+      // split into sub-steps of at most 1/60 s for stable physics
+      const want = dt * timeScale();
+      const n = Math.min(40, Math.max(1, Math.ceil(want / (1 / 60))));
+      const h = want / n;
+      for (let i = 0; i < n; i++) {
+        engine.step(h);
+        simDt += h;
         if (engine.decision && !shownDecision) break;
+        if (engine.phase === 'fulltime') break;
       }
-      if (steps >= 40) acc = 0;
       // decision handling (real time)
       const d = engine.decision;
       if (d && shownDecision !== d) showDecision();
@@ -234,7 +236,7 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
         feedEls.splice(i, 1);
       }
     }
-    renderer.render(dt, engine.decision ? 'user' : 'none');
+    renderer.render(dt, engine.decision ? 'user' : 'none', simDt);
     const pos = renderer.userScreen();
     const tag = $('m-tag');
     if (pos) {
