@@ -1,7 +1,7 @@
 import { t } from '../core/i18n';
 import type { MatchReport } from '../core/types';
 import { esc } from '../core/util';
-import type { DecisionOption, MatchSetup } from '../match/engine';
+import type { AimInfo, AimMode, DecisionOption, MatchSetup } from '../match/engine';
 import { MatchEngine } from '../match/engine';
 import { MatchRenderer } from '../match/render';
 
@@ -35,7 +35,7 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
       </div>
     </div>
     <div class="m-feed" id="m-feed"></div>
-    <div class="m-targets" id="m-targets"></div>
+    <div class="m-aim hidden" id="m-aim"></div>
     <div class="m-tag" id="m-tag">${esc(setup.user?.name.split(' ').slice(-1)[0] ?? '')}</div>
     <div class="m-status" id="m-status"></div>
     <div class="m-decision hidden" id="m-decision"></div>
@@ -68,51 +68,66 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
   };
   window.addEventListener('keydown', keyHandler);
 
-  function choose(id: string, targetId?: number) {
+  function choose(id: string, targetId?: number, aim?: { x: number; y: number; mode: AimMode }) {
     if (!engine.decision) return;
-    engine.resolve(id, targetId);
+    engine.resolve(id, targetId, aim);
     hideDecision();
   }
 
   function hideDecision() {
     shownDecision = null;
     $('m-decision').classList.add('hidden');
-    $('m-targets').innerHTML = '';
-    targetEls = [];
+    endAim();
   }
 
-  let targetEls: Array<{ el: HTMLElement; id: number }> = [];
-  function showTargets() {
-    const d = engine.decision!;
-    const wrap = $('m-targets');
-    wrap.innerHTML = '';
-    targetEls = d.targets.map((tg) => {
-      const el = document.createElement('button');
-      const pct = Math.round(tg.chance * 100);
-      const tone = pct >= 70 ? 'hi' : pct >= 45 ? 'mid' : 'lo';
-      el.className = `tgt ${tone}`;
-      el.innerHTML = `<b>${pct}%</b><span>${esc(tg.agent.name)}</span>`;
-      el.onclick = (e) => {
-        e.stopPropagation();
-        choose('pass_to', tg.agent.id);
-      };
-      wrap.appendChild(el);
-      return { el, id: tg.agent.id };
-    });
-  }
+  // ---- drawing a pass: drag on the pitch from the player to a point
+  let aimMode: AimMode = 'auto';
+  let aiming = false;
+  let aimInfo: AimInfo | null = null;
+  const canvasWrap = root.querySelector<HTMLElement>('.m-canvas')!;
+  const canAim = () => !!engine.decision && engine.decision.targets.length > 0 && !!engine.user;
 
-  function placeTargets() {
-    for (const t of targetEls) {
-      const a = engine.agents.find((x) => x.id === t.id)!;
-      const pos = renderer.screenOf(a, 2.7);
-      if (!pos) {
-        t.el.style.display = 'none';
-        continue;
-      }
-      t.el.style.display = '';
-      t.el.style.transform = `translate(${pos.x}px, ${pos.y}px) translate(-50%, -100%)`;
+  function updateAim(ev: PointerEvent) {
+    const r = canvasWrap.getBoundingClientRect();
+    const p = renderer.groundAt(ev.clientX - r.left, ev.clientY - r.top);
+    aimInfo = p ? engine.aimPass(p.x, p.y, aimMode) : null;
+    renderer.setAim(aimInfo, engine.user);
+    const lab = $('m-aim');
+    if (!aimInfo) {
+      lab.classList.add('hidden');
+      return;
     }
+    const pct = Math.round(aimInfo.chance * 100);
+    const kind = aimInfo.lofted ? (aimInfo.through ? 'aim.long_through' : 'aim.long') : aimInfo.through ? 'aim.through' : 'aim.short';
+    lab.className = `m-aim ${pct >= 65 ? 'hi' : pct >= 35 ? 'mid' : 'lo'}`;
+    lab.innerHTML = `<b>${pct}%</b><span>${t(kind)}${aimInfo.receiver ? ` · ${esc(aimInfo.receiver.name)}` : ''}</span>`;
+    lab.style.transform = `translate(${ev.clientX - r.left}px, ${ev.clientY - r.top - 18}px) translate(-50%, -100%)`;
   }
+
+  function endAim() {
+    aiming = false;
+    aimInfo = null;
+    renderer.setAim(null, null);
+    $('m-aim').classList.add('hidden');
+  }
+
+  canvasWrap.addEventListener('pointerdown', (ev) => {
+    if (!canAim()) return;
+    aiming = true;
+    canvasWrap.setPointerCapture(ev.pointerId);
+    updateAim(ev);
+  });
+  canvasWrap.addEventListener('pointermove', (ev) => {
+    if (aiming) updateAim(ev);
+  });
+  canvasWrap.addEventListener('pointerup', (ev) => {
+    if (!aiming) return;
+    updateAim(ev);
+    const info = aimInfo;
+    endAim();
+    if (info && canAim()) choose('pass_point', undefined, { x: info.x, y: info.y, mode: aimMode });
+  });
+  canvasWrap.addEventListener('pointercancel', () => endAim());
 
   function showDecision() {
     const d = engine.decision!;
@@ -122,9 +137,21 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
     el.className = `m-decision kind-${d.kind}`;
     el.innerHTML = `
       <div class="dec-head"><span>${t(d.setPiece ? `dec.sp.${d.setPiece}` : `dec.${d.kind}`)}</span><div class="dec-timer"><i id="dec-bar"></i></div></div>
-      ${d.targets.length ? `<div class="dec-hint">👆 ${t('dec.tap_mate')}</div>` : ''}
+      ${
+        d.targets.length
+          ? `<div class="dec-hint"><span>👆 ${t('dec.drag_hint')}</span><span class="aim-modes">${(['auto', 'ground', 'lofted'] as AimMode[])
+              .map((m) => `<button data-aim="${m}" class="${aimMode === m ? 'on' : ''}">${t(`aim.mode.${m}`)}</button>`)
+              .join('')}</span></div>`
+          : ''
+      }
       <div class="dec-opts">${d.options.map((o, i) => optHtml(o, i)).join('')}</div>`;
-    showTargets();
+    el.querySelectorAll<HTMLButtonElement>('button[data-aim]').forEach((b) => {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        aimMode = b.dataset.aim as AimMode;
+        el.querySelectorAll('button[data-aim]').forEach((x) => x.classList.toggle('on', x === b));
+      };
+    });
     el.querySelectorAll<HTMLButtonElement>('button[data-opt]').forEach((b) => {
       b.onclick = (e) => {
         e.stopPropagation();
@@ -237,7 +264,7 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
       if (d && shownDecision !== d) showDecision();
       if (!d && shownDecision) hideDecision();
       if (d) {
-        d.timeLeft -= dt;
+        if (!aiming) d.timeLeft -= dt;
         const bar = root.querySelector<HTMLElement>('#dec-bar');
         if (bar) bar.style.width = `${Math.max(0, (d.timeLeft / d.total) * 100)}%`;
         if (d.timeLeft <= 0) {
@@ -278,7 +305,6 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
       }
     }
     renderer.render(dt, engine.decision ? 'user' : 'none', simDt);
-    if (targetEls.length) placeTargets();
     const pos = renderer.userScreen();
     const tag = $('m-tag');
     if (pos) {

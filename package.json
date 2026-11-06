@@ -12,7 +12,8 @@
     "test:career": "tsx scripts/careertest.ts",
     "test:i18n": "tsx scripts/i18ncheck.ts",
     "test:shape": "tsx scripts/shape.ts",
-    "test:setpieces": "tsx scripts/setpieces.ts"
+    "test:setpieces": "tsx scripts/setpieces.ts",
+    "test:aim": "tsx scripts/aimtest.ts"
   },
   "dependencies": {
     "three": "^0.187.0"

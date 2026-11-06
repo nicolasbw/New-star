@@ -1585,78 +1585,83 @@ input:focus {
   font-size: 1.05rem;
 }
 
-.m-targets {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
+.m-canvas {
+  touch-action: none;
 }
 
-.tgt {
+.m-aim {
   position: absolute;
   left: 0;
   top: 0;
-  pointer-events: auto;
+  pointer-events: none;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0;
-  padding: 3px 8px 4px;
+  padding: 4px 10px 5px;
   border-radius: 10px;
   border: 2px solid currentColor;
-  background: rgba(8, 14, 12, 0.85);
-  cursor: pointer;
-  line-height: 1.05;
+  background: rgba(8, 14, 12, 0.88);
   font-family: var(--head);
-  animation: pop 0.18s;
-  min-width: 44px;
-}
-
-.tgt b {
-  font-size: 1rem;
-}
-
-.tgt span {
-  font-size: 0.68rem;
-  color: var(--text);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  max-width: 70px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.05;
   white-space: nowrap;
 }
 
-.tgt::after {
-  content: '';
-  position: absolute;
-  bottom: -7px;
-  left: 50%;
-  margin-left: -5px;
-  border: 5px solid transparent;
-  border-top-color: currentColor;
-  border-bottom: 0;
+.m-aim.hidden {
+  display: none;
 }
 
-.tgt.hi {
+.m-aim b {
+  font-size: 1.3rem;
+}
+
+.m-aim span {
+  font-size: 0.75rem;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.m-aim.hi {
   color: var(--green);
 }
 
-.tgt.mid {
+.m-aim.mid {
   color: var(--gold);
 }
 
-.tgt.lo {
+.m-aim.lo {
   color: var(--orange);
 }
 
-.tgt:hover,
-.tgt:focus-visible {
-  background: rgba(255, 216, 74, 0.25);
-  outline: none;
-}
-
 .dec-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
   font-size: 0.78rem;
   color: var(--muted);
   margin: -4px 0 8px;
+}
+
+.aim-modes {
+  display: inline-flex;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.aim-modes button {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+
+.aim-modes button.on {
+  background: var(--gold);
+  color: #1a1400;
 }

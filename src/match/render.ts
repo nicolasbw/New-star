@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { Agent, MatchEngine } from './engine';
+import type { Agent, AimInfo, MatchEngine } from './engine';
 import { GOAL_H, GOAL_HW, HL, HW } from './engine';
 
 const PX = 20; // canvas pixels per metre for the pitch texture
@@ -262,6 +262,12 @@ export class MatchRenderer {
   userArrow: THREE.Mesh;
   ownerRing: THREE.Mesh;
   camX = 0;
+  private aimMat!: THREE.MeshBasicMaterial;
+  private aimRibbon!: THREE.Mesh;
+  private aimDots: THREE.Mesh[] = [];
+  private aimTarget!: THREE.Mesh;
+  private raycaster = new THREE.Raycaster();
+  private ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   camZoom = 1;
   focusZ = 0;
   private disposed = false;
@@ -310,6 +316,29 @@ export class MatchRenderer {
     this.ownerRing = new THREE.Mesh(oGeo, new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.55, depthWrite: false }));
     this.ownerRing.position.y = 0.025;
     this.scene.add(this.ownerRing);
+
+    // aiming: a ribbon on the grass (ground pass) or dotted arc (lofted), plus a target ring
+    this.aimMat = new THREE.MeshBasicMaterial({ color: '#ffd84a', transparent: true, opacity: 0.85, depthWrite: false });
+    const rib = new THREE.PlaneGeometry(1, 0.32);
+    rib.rotateX(-Math.PI / 2);
+    rib.translate(0.5, 0, 0);
+    this.aimRibbon = new THREE.Mesh(rib, this.aimMat);
+    this.aimRibbon.position.y = 0.04;
+    this.aimRibbon.visible = false;
+    this.scene.add(this.aimRibbon);
+    const dotGeo = new THREE.SphereGeometry(0.16, 8, 6);
+    for (let i = 0; i < 18; i++) {
+      const m = new THREE.Mesh(dotGeo, this.aimMat);
+      m.visible = false;
+      this.aimDots.push(m);
+      this.scene.add(m);
+    }
+    const tg = new THREE.RingGeometry(0.8, 1.1, 32);
+    tg.rotateX(-Math.PI / 2);
+    this.aimTarget = new THREE.Mesh(tg, this.aimMat);
+    this.aimTarget.position.y = 0.05;
+    this.aimTarget.visible = false;
+    this.scene.add(this.aimTarget);
 
     this.resize();
   }
@@ -631,6 +660,47 @@ export class MatchRenderer {
     this.camera.position.set(this.camX, height, lookZ + dist);
     this.camera.lookAt(this.camX, 0, lookZ + (wantFocus ? 0 : portrait ? 7 : -2));
     this.renderer.render(this.scene, this.camera);
+  }
+
+  /** Pitch point (sim coords) under a screen position (CSS px, relative to the canvas). */
+  groundAt(cx: number, cy: number): { x: number; y: number } | null {
+    const el = this.renderer.domElement;
+    const ndc = new THREE.Vector2((cx / el.clientWidth) * 2 - 1, -(cy / el.clientHeight) * 2 + 1);
+    this.raycaster.setFromCamera(ndc, this.camera);
+    const hit = new THREE.Vector3();
+    if (!this.raycaster.ray.intersectPlane(this.ground, hit)) return null;
+    return { x: hit.x, y: hit.z };
+  }
+
+  /** Shows (or hides with null) the pass the player is drawing. */
+  setAim(info: AimInfo | null, from: Agent | null) {
+    const show = !!info && !!from;
+    this.aimTarget.visible = show;
+    this.aimRibbon.visible = show && !info!.lofted;
+    for (const d of this.aimDots) d.visible = false;
+    if (!show) return;
+    const c = info!.chance >= 0.65 ? '#3ddc84' : info!.chance >= 0.35 ? '#ffd84a' : '#ff8a3d';
+    this.aimMat.color.set(c);
+    const dx = info!.x - from!.x;
+    const dy = info!.y - from!.y;
+    const d = Math.hypot(dx, dy);
+    this.aimTarget.position.set(info!.x, 0.05, info!.y);
+    const pulse = 1 + Math.sin(performance.now() / 140) * 0.08;
+    this.aimTarget.scale.setScalar(pulse);
+    if (!info!.lofted) {
+      this.aimRibbon.position.set(from!.x, 0.04, from!.y);
+      this.aimRibbon.scale.set(d, 1, 1);
+      this.aimRibbon.rotation.y = -Math.atan2(dy, dx);
+    } else {
+      const h = Math.min(9, d * 0.18);
+      const n = this.aimDots.length;
+      for (let i = 0; i < n; i++) {
+        const f = (i + 1) / (n + 1);
+        const m = this.aimDots[i];
+        m.visible = true;
+        m.position.set(from!.x + dx * f, 0.2 + 4 * h * f * (1 - f), from!.y + dy * f);
+      }
+    }
   }
 
   /** Screen position (CSS px) above an agent's head. */

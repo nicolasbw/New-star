@@ -106,6 +106,7 @@ interface PassInfo {
   tx: number;
   ty: number;
   t0: number;
+  hold: number;
   userPass: boolean;
 }
 
@@ -142,6 +143,18 @@ export interface PassTarget {
   lofted: boolean;
 }
 
+export type AimMode = 'auto' | 'ground' | 'lofted';
+
+export interface AimInfo {
+  x: number; // clamped target point (world)
+  y: number;
+  chance: number;
+  lofted: boolean;
+  receiver: Agent | null;
+  interceptor: Agent | null;
+  through: boolean; // into space ahead of the receiver
+}
+
 export interface DecisionOption {
   id: string;
   chance: number;
@@ -149,7 +162,7 @@ export interface DecisionOption {
   attrs: AttrKey[];
   special?: boolean;
   safe?: boolean;
-  data?: { target?: Agent; opp?: Agent; zone?: { x: number; y: number }; lofted?: boolean };
+  data?: { target?: Agent; opp?: Agent; zone?: { x: number; y: number }; lofted?: boolean; aim?: AimInfo };
 }
 
 export type DecisionKind = 'onBall' | 'aerial' | 'offBall' | 'defend';
@@ -761,6 +774,8 @@ export class MatchEngine {
       userPass?: boolean;
       lead?: { x: number; y: number };
       throwIn?: boolean;
+      soft?: boolean; // weighted to arrive slowly (pass into space)
+      protectFor?: number; // seconds the pass stays protected
     } = {},
   ) {
     const b = this.ball;
@@ -809,7 +824,7 @@ export class MatchEngine {
       const T = d / speed;
       this.kick(from, tx, ty, speed, (G * T) / 2 + (opts.cross ? 0.6 : 0));
     } else {
-      const speed = clamp(d * 0.62 + 6, 9, 27);
+      const speed = clamp(d * 0.62 + (opts.soft ? 1.6 : 6), opts.soft ? 4 : 9, 27);
       this.kick(from, tx, ty, speed, 0.4);
     }
     this.dbg.passes++;
@@ -823,6 +838,7 @@ export class MatchEngine {
       tx,
       ty,
       t0: this.time,
+      hold: opts.protectFor ?? 3.2,
       userPass: !!opts.userPass,
     };
   }
@@ -1601,7 +1617,7 @@ export class MatchEngine {
   private claims() {
     const b = this.ball;
     if (b.owner) return;
-    if (b.pass && this.time - b.pass.t0 > 3.2) {
+    if (b.pass && this.time - b.pass.t0 > b.pass.hold) {
       b.pass.protect = false;
       b.pass.interceptor = null;
     }
@@ -1834,6 +1850,81 @@ export class MatchEngine {
     return { chance: clamp(ch, 0.06, 0.97), lofted };
   }
 
+  /** Time (s) for an agent to reach a point, including a short reaction. */
+  private arrival(a: Agent, x: number, y: number, react = 0.25) {
+    return react + dist(a.x, a.y, x, y) / this.maxSpeed(a);
+  }
+
+  /**
+   * Evaluates a pass from the user into a point (drawn by the player):
+   * who gets there first, the risk of an interception on the way, and the passer's skill.
+   */
+  aimPass(px: number, py: number, mode: AimMode = 'auto'): AimInfo | null {
+    const u = this.user;
+    if (!u) return null;
+    const x = clamp(px, -HL + 0.8, HL - 0.8);
+    const y = clamp(py, -HW + 0.8, HW - 0.8);
+    const d = dist(u.x, u.y, x, y);
+    if (d < 3) return null;
+    const P = this.eff(u, 'passing');
+    const V = this.eff(u, 'vision');
+    // opponents close to the line make a ground pass risky
+    let lane = 9;
+    for (const o of this.agents) {
+      if (o.team === u.team || o.sentOff) continue;
+      lane = Math.min(lane, segDist(o.x, o.y, u.x, u.y, x, y));
+    }
+    const lofted = mode === 'lofted' || (mode === 'auto' && (d > 30 || (lane < 2 && d > 15)));
+    // ball travel time
+    const speed = lofted ? clamp(d * 0.55 + 9, 14, 26) : clamp(d * 0.62 + 6, 9, 27);
+    const T = lofted ? d / speed : d / (speed * 0.82);
+    // best receiver: who arrives first
+    let receiver: Agent | null = null;
+    let rt = 1e9;
+    for (const t of this.teamOf(u.team)) {
+      if (t === u || t.stun > 0) continue;
+      const at = this.arrival(t, x, y, 0.3);
+      if (at < rt) {
+        rt = at;
+        receiver = t;
+      }
+    }
+    // the most dangerous opponent: at the point, or (ground passes) anywhere on the way
+    let interceptor: Agent | null = null;
+    let margin = 1e9;
+    for (const o of this.agents) {
+      if (o.team === u.team || o.sentOff) continue;
+      const atPoint = this.arrival(o, x, y, 0.35) - Math.max(rt, T);
+      let m = atPoint;
+      if (!lofted) {
+        for (const f of [0.25, 0.45, 0.65, 0.85]) {
+          const sx = u.x + (x - u.x) * f;
+          const sy = u.y + (y - u.y) * f;
+          m = Math.min(m, this.arrival(o, sx, sy, 0.3) - T * f + 0.15);
+        }
+      } else {
+        // a high ball can only be won where it lands
+        m = Math.min(m, this.arrival(o, x, y, 0.35) - T);
+      }
+      if (m < margin) {
+        margin = m;
+        interceptor = o;
+      }
+    }
+    if (!receiver) return null;
+    // the receiver has to get there in time for the ball (or shortly after)
+    const late = Math.max(0, rt - T - 0.6);
+    let ch = 0.55 + clamp(margin, -1.5, 1.5) * 0.32 + (P - 60) / 220;
+    ch -= late * 0.22;
+    ch -= Math.max(0, d - 12) * Math.max(0.002, 0.008 - P / 15000);
+    if (lofted) ch -= 0.06 - (V - 55) / 900;
+    if (!u.holdUp && this.nearestOpp(u).d < 1.8) ch -= 0.08;
+    const rn = this.n(u.team, receiver.x, receiver.y);
+    const pn = this.n(u.team, x, y);
+    const through = pn.x - rn.x > 3 || dist(receiver.x, receiver.y, x, y) > 4;
+    return { x, y, chance: clamp(ch, 0.04, 0.96), lofted, receiver, interceptor, through };
+  }
+
   passTargets(maxD: number): PassTarget[] {
     const u = this.user;
     if (!u) return [];
@@ -2038,12 +2129,18 @@ export class MatchEngine {
   }
 
   /** Applies the player's choice. Returns whether it succeeded. */
-  resolve(optionId: string, targetId?: number): boolean | null {
+  resolve(optionId: string, targetId?: number, aim?: { x: number; y: number; mode: AimMode }): boolean | null {
     const d = this.decision;
     const u = this.user;
     if (!d || !u) {
       this.decision = null;
       return null;
+    }
+    if (optionId === 'pass_point') {
+      const info = aim ? this.aimPass(aim.x, aim.y, aim.mode) : null;
+      if (info && info.receiver) {
+        d.options = [...d.options, { id: 'pass_point', chance: info.chance, kind: 'success', attrs: ['passing', 'vision'], data: { aim: info } }];
+      } else optionId = this.autoChoice();
     }
     if (optionId === 'pass_to') {
       const tg = d.targets.find((x) => x.agent.id === targetId);
@@ -2089,6 +2186,29 @@ export class MatchEngine {
           const interceptor = this.nearestOpp(t, (u.x + t.x) / 2, (u.y + t.y) / 2).agent;
           this.ratingAcc -= 0.12;
           this.pass(u, t, { interceptor, userPass: true, lofted, cross });
+          this.push(`res.${resKey}.bad`, 'bad');
+        }
+        return !!ok;
+      }
+      case 'pass_point': {
+        const info = opt.data!.aim!;
+        const t = info.receiver!;
+        this.stats.passes++;
+        const tn = this.n(u.team, info.x, info.y);
+        const un = this.n(u.team, u.x, u.y);
+        const cross = tn.x > HL - 17 && Math.abs(tn.y) < 18 && Math.abs(un.y) > 14 && un.x > 20;
+        const resKey = cross ? 'cross' : info.lofted ? 'pass_long' : info.through ? 'pass_through' : 'pass_short';
+        if (ok) {
+          this.stats.passesOk++;
+          const gain = tn.x - un.x;
+          this.ratingAcc += clamp(0.01 + gain * 0.006 + (info.through ? 0.04 : 0), 0, 0.18);
+          const reach = this.arrival(t, info.x, info.y, 0.3);
+          this.pass(u, t, { protect: true, userPass: true, lofted: info.lofted, cross, soft: true, lead: { x: info.x, y: info.y }, protectFor: Math.max(3.2, reach + 1.5) });
+          t.runTo = { x: info.x, y: info.y, t: 3 };
+          this.push(`res.${resKey}.ok`, 'good');
+        } else {
+          this.ratingAcc -= 0.12;
+          this.pass(u, t, { interceptor: info.interceptor, userPass: true, lofted: info.lofted, cross, soft: true, lead: { x: info.x, y: info.y } });
           this.push(`res.${resKey}.bad`, 'bad');
         }
         return !!ok;
