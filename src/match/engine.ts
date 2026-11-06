@@ -74,6 +74,23 @@ export interface Agent {
   supY: number;
   diveT: number;
   touchAnim: number;
+  holdUp: boolean; // holding the ball over the head (throw-in)
+  throwAnim: number;
+}
+
+export type SetPieceKind = 'throw' | 'corner' | 'goalkick' | 'freekick';
+
+interface SetPiece {
+  kind: SetPieceKind;
+  team: 0 | 1;
+  x: number; // ball spot (world)
+  y: number;
+  taker: Agent;
+  standX: number; // where the taker waits
+  standY: number;
+  state: 'walk' | 'set' | 'runup';
+  timer: number;
+  spots: Map<number, { x: number; y: number }>;
 }
 
 // Tactical identity of each slot: line depth offset, overlap flag.
@@ -119,6 +136,12 @@ export interface Ball {
 
 export type Phase = 'kickoff' | 'play' | 'restart' | 'goal' | 'halftime' | 'fulltime';
 
+export interface PassTarget {
+  agent: Agent;
+  chance: number;
+  lofted: boolean;
+}
+
 export interface DecisionOption {
   id: string;
   chance: number;
@@ -126,7 +149,7 @@ export interface DecisionOption {
   attrs: AttrKey[];
   special?: boolean;
   safe?: boolean;
-  data?: { target?: Agent; opp?: Agent };
+  data?: { target?: Agent; opp?: Agent; zone?: { x: number; y: number }; lofted?: boolean };
 }
 
 export type DecisionKind = 'onBall' | 'aerial' | 'offBall' | 'defend';
@@ -134,6 +157,8 @@ export type DecisionKind = 'onBall' | 'aerial' | 'offBall' | 'defend';
 export interface Decision {
   kind: DecisionKind;
   options: DecisionOption[];
+  targets: PassTarget[]; // teammates you can tap to pass to
+  setPiece?: SetPieceKind;
   timeLeft: number;
   total: number;
 }
@@ -247,6 +272,8 @@ export class MatchEngine {
   private scheduled: Array<{ at: number; epoch: number; fn: () => void }> = [];
   private chasers: [Agent | null, Agent | null] = [null, null];
   private supporters: [Agent[], Agent[]] = [[], []];
+  setPiece: SetPiece | null = null;
+  private userSetPiece: SetPieceKind | null = null;
   private runTimer: [number, number] = [2, 2];
   private pressers: [Agent[], Agent[]] = [[], []];
   benchUser: { slot: number } | null = null;
@@ -297,6 +324,8 @@ export class MatchEngine {
           supY: 0,
           diveT: 0,
           touchAnim: 0,
+          holdUp: false,
+          throwAnim: 0,
         });
       });
     }
@@ -393,6 +422,9 @@ export class MatchEngine {
   // ------------------------------------------------------------------ set pieces
   kickoff(team: 0 | 1) {
     this.epoch++;
+    this.setPiece = null;
+    this.userSetPiece = null;
+    for (const a of this.agents) a.holdUp = false;
     this.phase = 'kickoff';
     this.phaseTimer = 1.6;
     this.kickoffTeam = team;
@@ -434,40 +466,234 @@ export class MatchEngine {
     b.z = 0;
   }
 
-  restart(kind: 'throw' | 'corner' | 'goalkick' | 'freekick', team: 0 | 1, x: number, y: number) {
+  restart(kind: SetPieceKind, team: 0 | 1, x: number, y: number, forceTaker?: Agent) {
     this.epoch++;
     this.phase = 'restart';
-    this.phaseTimer = kind === 'throw' ? 0.9 : kind === 'freekick' ? 1.0 : 1.5;
+    this.decision = null;
     const b = this.ball;
     b.pass = null;
     b.shot = null;
-    let taker: Agent;
+    b.owner = null;
     if (kind === 'goalkick') {
-      taker = this.gk(team);
-      const w = this.n(team, -46, 0);
+      const w = this.n(team, -HL + 6, 0);
       x = w.x;
       y = w.y;
-    } else {
-      const cands = this.teamOf(team).filter((a) => a.role !== 'GK');
-      cands.sort((p, q) => dist(p.x, p.y, x, y) + (p.isUser ? 12 : 0) - dist(q.x, q.y, x, y) - (q.isUser ? 12 : 0));
-      taker = cands[0];
     }
-    taker.x = x;
-    taker.y = y;
-    taker.vx = taker.vy = 0;
-    taker.runTo = null;
-    for (const o of this.agents) {
-      if (o.team === team || o.sentOff) continue;
-      const d = dist(o.x, o.y, x, y);
-      if (d < 7) {
-        const k = (7 - d) / (d || 1);
-        o.x += (o.x - x) * k;
-        o.y += (o.y - y) * k;
+    if (kind === 'throw') y = Math.sign(y) * HW;
+    b.x = x;
+    b.y = y;
+    b.z = 0;
+    b.vx = b.vy = b.vz = 0;
+    for (const a of this.agents) {
+      a.aiRun = null;
+      a.runTo = null;
+      a.holdUp = false;
+    }
+    // taker
+    let taker: Agent;
+    const u = this.user;
+    if (forceTaker) taker = forceTaker;
+    else if (kind === 'goalkick') taker = this.gk(team);
+    else {
+      const cands = this.teamOf(team).filter((a) => a.role !== 'GK');
+      cands.sort((p, q) => dist(p.x, p.y, x, y) - dist(q.x, q.y, x, y));
+      taker = cands[0];
+      if (u && this.userOnField && u.team === team && !u.sentOff) {
+        const du = dist(u.x, u.y, x, y);
+        const ud = this.n(team, x, y);
+        const dGoal = dist(ud.x, ud.y, HL, 0);
+        const goodCrosser = u.attrs.passing >= 55 && u.role !== 'DEF' && u.slot !== 9;
+        if (kind === 'throw' && du < 14) taker = u;
+        if (kind === 'corner' && goodCrosser) taker = u;
+        if (kind === 'freekick' && (du < 16 || (dGoal < 32 && u.attrs.shooting >= 62))) taker = u;
+      }
+      if (taker.isUser && kind !== 'throw' && taker !== u) taker = cands[0];
+    }
+    // where the taker stands
+    let sx = x;
+    let sy = y;
+    if (kind !== 'throw') {
+      const gx = this.attackGoalX(team);
+      const aimX = kind === 'corner' ? gx - Math.sign(gx) * 11 : gx;
+      const aimY = 0;
+      const d = dist(x, y, aimX, aimY) || 1;
+      sx = x - ((aimX - x) / d) * 2.2;
+      sy = y - ((aimY - y) / d) * 2.2;
+      if (kind === 'corner') sy = clamp(sy, -HW - 1.5, HW + 1.5);
+    }
+    this.setPiece = { kind, team, x, y, taker, standX: sx, standY: sy, state: 'walk', timer: 3.6, spots: new Map() };
+    this.userSetPiece = taker.isUser ? kind : null;
+    this.planSetPiece();
+    this.push(`feed.${kind}`, 'info', { team: this.teamName(team) });
+  }
+
+  /** Positions for both teams at a set piece. */
+  private planSetPiece() {
+    const sp = this.setPiece!;
+    const att = sp.team;
+    const def: 0 | 1 = att === 0 ? 1 : 0;
+    const put = (a: Agent, team: 0 | 1, nx: number, ny: number) => {
+      const w = this.n(team, nx, ny);
+      sp.spots.set(a.id, { x: w.x, y: w.y });
+    };
+    const outfield = (team: 0 | 1) => this.teamOf(team).filter((a) => a.role !== 'GK' && a !== sp.taker);
+    const bn = this.n(att, sp.x, sp.y);
+    const side = Math.sign(bn.y) || 1;
+    if (sp.kind === 'corner') {
+      // attackers: the best headers attack the box, two at the edge, the rest stay back
+      const prio = (a: Agent) => (a.role === 'DEF' && Math.abs(a.by) < 15 ? 0 : a.role === 'FWD' ? 1 : a.role === 'MID' && a.depth >= 0 ? 2 : a.role === 'MID' ? 4 : 5);
+      const mates = outfield(att).sort((p, q) => prio(p) - prio(q));
+      const spots: Array<[number, number]> = [
+        [HL - 5, side * 2.5], [HL - 7, -side * 3.5], [HL - 11, 0], [HL - 8.5, side * 6.5], [HL - 6, -side * 7.5],
+        [HL - 18, side * 6], [HL - 19, -side * 7], [2, -12], [4, 12], [-8, 0],
+      ];
+      mates.forEach((a, i) => put(a, att, spots[i][0] + rand(-0.6, 0.6), spots[i][1] + rand(-0.6, 0.6)));
+      // defenders: zonal marking in the six-yard box, one striker stays up
+      const dside = -side;
+      const zone: Array<[number, number]> = [
+        [-HL + 1.2, dside * 4.6], [-HL + 3, dside * 2], [-HL + 3, -dside * 2], [-HL + 5.5, dside * 5.5], [-HL + 5.5, 0],
+        [-HL + 5.5, -dside * 5.5], [-HL + 9, dside * 3], [-HL + 9, -dside * 3], [-HL + 15, 0], [-14, dside * 8],
+      ];
+      const dprio = (a: Agent) => (a.role === 'DEF' ? 0 : a.role === 'MID' ? 1 : a.slot === 9 ? 3 : 2);
+      outfield(def)
+        .sort((p, q) => dprio(p) - dprio(q))
+        .forEach((a, i) => put(a, def, zone[i][0] + rand(-0.4, 0.4), zone[i][1] + rand(-0.4, 0.4)));
+      put(this.gk(def), def, -HL + 0.7, dside * 0.9);
+    } else if (sp.kind === 'throw') {
+      // three teammates offer short options, the nearest opponents mark them
+      const mates = outfield(att).sort((p, q) => dist(p.x, p.y, sp.x, sp.y) - dist(q.x, q.y, sp.x, sp.y)).slice(0, 3);
+      const inward = -side;
+      const offers: Array<[number, number]> = [
+        [bn.x + 9, bn.y + inward * 5], [bn.x - 7, bn.y + inward * 6], [bn.x + 2, bn.y + inward * 13],
+      ];
+      mates.forEach((a, i) => put(a, att, clamp(offers[i][0], -HL + 3, HL - 3), clamp(offers[i][1], -HW + 2, HW - 2)));
+      const markers = outfield(def).sort((p, q) => dist(p.x, p.y, sp.x, sp.y) - dist(q.x, q.y, sp.x, sp.y)).slice(0, 3);
+      mates.forEach((m, i) => {
+        const tgt = sp.spots.get(m.id)!;
+        const own = -this.attackGoalX(def);
+        const k = 1.6 / (dist(tgt.x, tgt.y, own, 0) || 1);
+        if (markers[i]) sp.spots.set(markers[i].id, { x: tgt.x + (own - tgt.x) * k, y: tgt.y - tgt.y * k });
+      });
+    } else if (sp.kind === 'goalkick') {
+      for (const a of outfield(att)) {
+        if (a.role === 'DEF' && Math.abs(a.by) < 15) put(a, att, -HL + 15, Math.sign(a.by) * 17);
+        else if (a.role === 'DEF') put(a, att, -27, Math.sign(a.by) * 29);
+        else if (a.slot === 5) put(a, att, -30, 0);
+      }
+      // opponents wait outside the box, pressing high
+      for (const a of outfield(def)) {
+        const ax = this.n(def, a.x, a.y);
+        if (a.role === 'FWD') put(a, def, HL - 21, a.by * 0.9);
+        else if (a.role === 'MID') put(a, def, 8 + a.depth, a.by * 0.8);
+        else void ax;
+      }
+    } else if (sp.kind === 'freekick') {
+      const dGoal = dist(bn.x, bn.y, HL, 0);
+      if (dGoal < 32 && bn.x > 10) {
+        // a wall 9.15 m from the ball on the line to goal
+        const ang = Math.atan2(-bn.y, HL - bn.x);
+        const wx = bn.x + Math.cos(ang) * 9.15;
+        const wy = bn.y + Math.sin(ang) * 9.15;
+        const wall = outfield(def).sort((p, q) => dist(p.x, p.y, sp.x, sp.y) - dist(q.x, q.y, sp.x, sp.y)).slice(0, dGoal < 24 ? 4 : 3);
+        wall.forEach((a, i) => {
+          const off = (i - (wall.length - 1) / 2) * 0.75;
+          // positions are in the attacking team's frame here; convert per agent
+          const w = this.n(att, wx - Math.sin(ang) * off, wy + Math.cos(ang) * off);
+          sp.spots.set(a.id, { x: w.x, y: w.y });
+        });
+        // attackers fill the box for a cross or a rebound
+        const box: Array<[number, number]> = [[HL - 8, -5], [HL - 9, 3], [HL - 12, 8], [HL - 13, -9]];
+        outfield(att)
+          .filter((a) => a.role !== 'DEF' || Math.abs(a.by) < 15)
+          .slice(0, 4)
+          .forEach((a, i) => put(a, att, box[i][0], box[i][1]));
       }
     }
-    this.giveBall(taker, true);
-    taker.decideCd = 99;
-    this.push(`feed.${kind}`, 'info', { team: this.teamName(team) });
+  }
+
+  private updateSetPiece(dt: number) {
+    const sp = this.setPiece;
+    if (!sp) return;
+    const t = sp.taker;
+    const b = this.ball;
+    sp.timer -= dt;
+    if (sp.state === 'walk') {
+      const d = dist(t.x, t.y, sp.standX, sp.standY);
+      if (d < 0.6 || sp.timer <= 0) {
+        if (sp.timer <= 0) {
+          t.x = sp.standX;
+          t.y = sp.standY;
+        }
+        t.vx = t.vy = 0;
+        sp.state = 'set';
+        sp.timer = sp.kind === 'throw' ? 0.7 : sp.kind === 'goalkick' ? 1.1 : 1.0;
+        if (sp.kind === 'throw') {
+          t.holdUp = true;
+          this.giveBall(t, true);
+          t.decideCd = 99;
+        }
+      }
+    } else if (sp.state === 'set') {
+      // wait until (almost) everybody has taken position, at most ~3.5 s
+      let off = 0;
+      for (const [id, p] of sp.spots) {
+        const a = this.agents[id];
+        if (!a.sentOff && dist(a.x, a.y, p.x, p.y) > 2.5) off++;
+      }
+      const ready = off <= Math.max(1, Math.floor(sp.spots.size * 0.15)) || sp.timer < -3.5;
+      if (sp.timer <= 0 && ready) {
+        if (sp.kind === 'throw') this.takeSetPiece();
+        else sp.state = 'runup';
+      }
+    } else if (sp.state === 'runup') {
+      const d = dist(t.x, t.y, b.x, b.y);
+      if (d < 0.7) {
+        this.giveBall(t, true);
+        this.takeSetPiece();
+      }
+    }
+  }
+
+  /** The taker has the ball: AI executes, or the user decides. */
+  private takeSetPiece() {
+    const sp = this.setPiece!;
+    const t = sp.taker;
+    this.phase = 'play';
+    this.setPiece = null;
+    t.decideCd = 0;
+    if (t.isUser) {
+      this.openOnBall();
+      return;
+    }
+    t.holdUp = false;
+    const tn = this.n(t.team, t.x, t.y);
+    if (sp.kind === 'throw') {
+      const best = this.bestPass(t, { minD: 4, maxD: 22 });
+      if (best) this.pass(t, best.to, { throwIn: true });
+      else t.decideCd = 0;
+      t.throwAnim = 0.35;
+      return;
+    }
+    if (sp.kind === 'corner') {
+      const short = Math.random() < 0.15 ? this.bestPass(t, { minD: 5, maxD: 18 }) : null;
+      const box = this.bestPass(t, { minD: 6, maxD: 50, inBox: true });
+      if (short) this.pass(t, short.to);
+      else if (box) this.pass(t, box.to, { cross: true });
+      return;
+    }
+    if (sp.kind === 'goalkick') {
+      const long = Math.random() < 0.55 ? this.bestPass(t, { minD: 35, maxD: 70 }) : null;
+      const short = this.bestPass(t, { minD: 8, maxD: 30 });
+      const pick = long ?? short ?? this.bestPass(t, { minD: 3, maxD: 70 });
+      if (pick) this.pass(t, pick.to, { lofted: dist(t.x, t.y, pick.to.x, pick.to.y) > 30 });
+      return;
+    }
+    // free kick
+    const dGoal = dist(tn.x, tn.y, HL, 0);
+    if (dGoal < 30 && Math.abs(tn.y) < 18 && Math.random() < 0.6) {
+      this.shoot(t, 'finesse');
+      return;
+    }
   }
 
   teamName(team: 0 | 1) {
@@ -527,9 +753,22 @@ export class MatchEngine {
   pass(
     from: Agent,
     to: Agent,
-    opts: { protect?: boolean; interceptor?: Agent | null; lofted?: boolean; cross?: boolean; userPass?: boolean; lead?: { x: number; y: number } } = {},
+    opts: {
+      protect?: boolean;
+      interceptor?: Agent | null;
+      lofted?: boolean;
+      cross?: boolean;
+      userPass?: boolean;
+      lead?: { x: number; y: number };
+      throwIn?: boolean;
+    } = {},
   ) {
     const b = this.ball;
+    if (from.holdUp) {
+      from.holdUp = false;
+      from.throwAnim = 0.35;
+      opts.throwIn = true;
+    }
     let tx = opts.lead?.x ?? to.x;
     let ty = opts.lead?.y ?? to.y;
     const d0 = dist(b.x, b.y, tx, ty);
@@ -559,8 +798,13 @@ export class MatchEngine {
       ty = clamp(ty, -HW + 1, HW - 1);
     }
     const d = dist(b.x, b.y, tx, ty);
-    const lofted = opts.lofted || opts.cross || d > 32;
-    if (lofted) {
+    const lofted = !opts.throwIn && (opts.lofted || opts.cross || d > 32);
+    if (opts.throwIn) {
+      const speed = clamp(d * 0.45 + 7, 8, 15);
+      const T = d / speed;
+      this.kick(from, tx, ty, speed, (0 - b.z + 0.5 * G * T * T) / T);
+      from.kickAnim = 0;
+    } else if (lofted) {
       const speed = clamp(d * 0.55 + 9, 14, 26);
       const T = d / speed;
       this.kick(from, tx, ty, speed, (G * T) / 2 + (opts.cross ? 0.6 : 0));
@@ -676,7 +920,7 @@ export class MatchEngine {
 
   // ------------------------------------------------------------------ main step
   step(dt: number) {
-    if (this.phase === 'fulltime') return;
+    if (this.phase === 'fulltime' || !(dt > 0)) return;
     this.time += dt;
     // scheduled callbacks
     if (this.scheduled.length) {
@@ -692,6 +936,7 @@ export class MatchEngine {
       a.tackleCd = Math.max(0, a.tackleCd - dt);
       a.kickAnim = Math.max(0, a.kickAnim - dt);
       a.touchAnim = Math.max(0, a.touchAnim - dt);
+      a.throwAnim = Math.max(0, a.throwAnim - dt);
       a.celebrate = Math.max(0, a.celebrate - dt);
       a.react = Math.max(0, a.react - dt);
       a.supT -= dt;
@@ -710,8 +955,12 @@ export class MatchEngine {
     }
 
     switch (this.phase) {
-      case 'kickoff':
       case 'restart':
+        this.moveAgents(dt);
+        this.updateBall(dt);
+        this.updateSetPiece(dt);
+        break;
+      case 'kickoff':
         this.moveAgents(dt);
         this.updateBall(dt);
         if (!this.decision) this.phaseTimer -= dt;
@@ -913,6 +1162,15 @@ export class MatchEngine {
 
   private target(a: Agent): { x: number; y: number; sprint: boolean } {
     const b = this.ball;
+    const sp = this.setPiece;
+    if (this.phase === 'restart' && sp) {
+      if (a === sp.taker) {
+        if (sp.state === 'runup') return { x: b.x, y: b.y, sprint: false };
+        return { x: sp.standX, y: sp.standY, sprint: dist(a.x, a.y, sp.standX, sp.standY) > 4 };
+      }
+      const spot = sp.spots.get(a.id);
+      if (spot) return { x: spot.x, y: spot.y, sprint: dist(a.x, a.y, spot.x, spot.y) > 6 };
+    }
     if (a.runTo) return { x: a.runTo.x, y: a.runTo.y, sprint: true };
     const nb = this.n(a.team, b.x, b.y);
     const att = this.possession === a.team;
@@ -1002,11 +1260,22 @@ export class MatchEngine {
     const pull = att ? 0.22 : 0.42;
     let ty = a.by * width + nb.y * pull + a.jitterY;
     ty = clamp(ty, -HW + 1.5, HW - 1.5);
-    if (this.phase === 'restart' && b.owner && b.owner.team !== a.team) {
-      const d = dist(a.x, a.y, b.x, b.y);
-      if (d < 8) {
-        const w0 = this.n(a.team, tx, ty);
-        return { x: w0.x, y: w0.y, sprint: true };
+    if (this.phase === 'restart' && sp && sp.team !== a.team) {
+      const w0 = this.n(a.team, tx, ty);
+      const d = dist(w0.x, w0.y, sp.x, sp.y);
+      const r = sp.kind === 'throw' ? 3 : 9.15;
+      if (d < r) {
+        const k = r / (d || 1);
+        return { x: sp.x + (w0.x - sp.x) * k, y: sp.y + (w0.y - sp.y) * k, sprint: true };
+      }
+    }
+    if (this.phase === 'restart' && sp?.kind === 'goalkick' && sp.team !== a.team) {
+      // stay out of the box at goal kicks
+      const wt = this.n(a.team, tx, ty);
+      const kn = this.n(sp.team, wt.x, wt.y);
+      if (kn.x < -HL + 18) {
+        const w1 = this.n(sp.team, -HL + 18, kn.y);
+        return { x: w1.x, y: w1.y, sprint: true };
       }
     }
     const w = this.n(a.team, tx, ty);
@@ -1253,6 +1522,20 @@ export class MatchEngine {
   private updateBall(dt: number) {
     const b = this.ball;
     const o = b.owner;
+    if (!o && this.phase === 'restart' && this.setPiece) {
+      b.x = this.setPiece.x;
+      b.y = this.setPiece.y;
+      b.z = 0;
+      b.vx = b.vy = b.vz = 0;
+      return;
+    }
+    if (o && o.holdUp) {
+      b.x = o.x + Math.cos(o.dir) * 0.1;
+      b.y = o.y + Math.sin(o.dir) * 0.1;
+      b.z = 2.05 * 1.18;
+      b.vx = b.vy = b.vz = 0;
+      return;
+    }
     if (o) {
       const sp = Math.hypot(o.vx, o.vy);
       const inHands = o.role === 'GK' && (this.phase !== 'play' || o.holdTime < 1.2) && this.n(o.team, o.x, o.y).x < -HL + 16.5;
@@ -1356,7 +1639,14 @@ export class MatchEngine {
         this.giveBall(a);
         return;
       }
+      const firstTime = !!p?.cross && a.team === p.from.team && !a.isUser;
+      const z = b.z;
       this.giveBall(a);
+      if (firstTime) {
+        // crosses are attacked first time: header if high, volley if low
+        const an = this.n(a.team, a.x, a.y);
+        if (an.x > HL - 16 && Math.abs(an.y) < 14 && Math.random() < 0.8) this.shoot(a, z > 1.0 ? 'header' : 'volley');
+      }
       return;
     }
   }
@@ -1502,10 +1792,10 @@ export class MatchEngine {
     }
   }
 
-  private open(kind: DecisionKind, options: DecisionOption[]) {
+  private open(kind: DecisionKind, options: DecisionOption[], targets: PassTarget[] = [], setPiece?: SetPieceKind) {
     if (!options.length) return;
     const total = kind === 'onBall' || kind === 'aerial' ? 7 : 6;
-    this.decision = { kind, options, timeLeft: total, total };
+    this.decision = { kind, options, timeLeft: total + (targets.length ? 1.5 : 0), total: total + (targets.length ? 1.5 : 0), targets, setPiece };
     this.stats.decisions++;
     this.counts[kind === 'aerial' ? 'onBall' : kind]++;
   }
@@ -1513,12 +1803,102 @@ export class MatchEngine {
   openOnBall() {
     if (!this.user || !this.userOnField) return;
     this.userRetrigger = -1;
-    this.open('onBall', this.buildOnBall());
+    const spk = this.userSetPiece;
+    this.userSetPiece = null;
+    if (spk) {
+      this.open('onBall', this.buildSetPieceOptions(spk), this.passTargets(spk === 'throw' ? 26 : 55), spk);
+      return;
+    }
+    this.open('onBall', this.buildOnBall(), this.passTargets(55));
+  }
+
+  /** Chance of completing a pass from the user to a given teammate. */
+  passChance(u: Agent, t: Agent) {
+    const P = this.eff(u, 'passing');
+    const V = this.eff(u, 'vision');
+    const d = dist(u.x, u.y, t.x, t.y);
+    let lane = 5;
+    let open = 8;
+    for (const o of this.agents) {
+      if (o.team === u.team || o.sentOff) continue;
+      lane = Math.min(lane, segDist(o.x, o.y, u.x, u.y, t.x, t.y));
+      open = Math.min(open, dist(o.x, o.y, t.x, t.y));
+    }
+    const lofted = d > 30 || (lane < 1.5 && d > 14);
+    let ch = 0.6 + P / 280;
+    ch -= Math.max(0, d - 10) * Math.max(0.003, 0.011 - P / 16000);
+    if (!lofted) ch -= Math.max(0, 2.2 - lane) * 0.17;
+    else ch -= Math.max(0, 1.2 - lane) * 0.05 + 0.05 - V / 1100;
+    ch -= Math.max(0, 2 - open) * 0.08;
+    if (!u.holdUp && this.nearestOpp(u).d < 1.8) ch -= 0.07;
+    return { chance: clamp(ch, 0.06, 0.97), lofted };
+  }
+
+  passTargets(maxD: number): PassTarget[] {
+    const u = this.user;
+    if (!u) return [];
+    const un = this.n(u.team, u.x, u.y);
+    const out: PassTarget[] = [];
+    for (const t of this.teamOf(u.team)) {
+      if (t === u) continue;
+      if (t.role === 'GK' && un.x > -25) continue;
+      const d = dist(u.x, u.y, t.x, t.y);
+      if (d < 3.5 || d > maxD) continue;
+      const pc = this.passChance(u, t);
+      out.push({ agent: t, chance: pc.chance, lofted: pc.lofted });
+    }
+    return out;
+  }
+
+  private buildSetPieceOptions(kind: SetPieceKind): DecisionOption[] {
+    const u = this.user!;
+    const P = (k: AttrKey) => this.eff(u, k);
+    const o: DecisionOption[] = [];
+    if (kind === 'corner') {
+      const un = this.n(u.team, u.x, u.y);
+      const side = Math.sign(un.y) || 1;
+      const zones: Array<[string, number, number]> = [
+        ['cross_near', HL - 5, side * 2.5],
+        ['cross_far', HL - 7, -side * 4],
+        ['cross_spot', HL - 11, 0],
+      ];
+      for (const [id, zx, zy] of zones) {
+        const zw = this.n(u.team, zx, zy);
+        const mates = this.teamOf(u.team).filter((a) => a !== u && a.role !== 'GK');
+        mates.sort((p, q) => dist(p.x, p.y, zw.x, zw.y) - dist(q.x, q.y, zw.x, zw.y));
+        const tgt = mates[0];
+        let crowd = 0;
+        for (const d of this.teamOf(u.team === 0 ? 1 : 0)) if (dist(d.x, d.y, zw.x, zw.y) < 2.6) crowd++;
+        const ch = clamp(0.34 + P('passing') / 250 + tgt.attrs.physical / 650 - crowd * 0.05 - dist(tgt.x, tgt.y, zw.x, zw.y) * 0.02, 0.12, 0.86);
+        o.push({ id, chance: ch, kind: 'success', attrs: ['passing'], data: { target: tgt, zone: { x: zw.x, y: zw.y } } });
+      }
+      const short = this.bestPass(u, { minD: 4, maxD: 18 });
+      if (short) o.push({ id: 'pass_short', chance: clamp(0.75 + P('passing') / 400, 0.5, 0.97), kind: 'success', attrs: ['passing'], safe: true, data: { target: short.to } });
+      if (!o.some((x) => x.safe)) o[o.length - 1].safe = true;
+      return o;
+    }
+    if (kind === 'freekick') {
+      const un = this.n(u.team, u.x, u.y);
+      const dGoal = dist(un.x, un.y, HL, 0);
+      if (dGoal < 33 && Math.abs(un.y) < 20 && un.x > 15) {
+        const m = this.shotModel(u, 'finesse');
+        o.push({ id: 'fk_shot', chance: clamp(m.goal * 0.85 + (P('composure') - 60) / 500, 0.02, 0.4), kind: 'goal', attrs: ['shooting', 'composure'] });
+      }
+    }
+    // throw-ins and other free kicks: the usual passing options
+    const base = this.buildOnBall().filter((x) => x.id.startsWith('pass_') || x.id === 'cross');
+    o.push(...base);
+    if (!o.length) {
+      const t = this.bestPass(u, { minD: 3, maxD: 30 });
+      if (t) o.push({ id: 'pass_short', chance: 0.85, kind: 'success', attrs: ['passing'], safe: true, data: { target: t.to } });
+    }
+    if (o.length && !o.some((x) => x.safe)) o[o.length - 1].safe = true;
+    return o;
   }
 
   openAerial() {
     if (!this.user) return;
-    this.open('aerial', this.buildAerial());
+    this.open('aerial', this.buildAerial(), []);
   }
 
   openOffBall(c: Agent) {
@@ -1658,12 +2038,21 @@ export class MatchEngine {
   }
 
   /** Applies the player's choice. Returns whether it succeeded. */
-  resolve(optionId: string): boolean | null {
+  resolve(optionId: string, targetId?: number): boolean | null {
     const d = this.decision;
     const u = this.user;
     if (!d || !u) {
       this.decision = null;
       return null;
+    }
+    if (optionId === 'pass_to') {
+      const tg = d.targets.find((x) => x.agent.id === targetId);
+      if (tg) {
+        d.options = [
+          ...d.options,
+          { id: 'pass_to', chance: tg.chance, kind: 'success', attrs: ['passing'], data: { target: tg.agent, lofted: tg.lofted } },
+        ];
+      } else optionId = this.autoChoice();
     }
     const opt = d.options.find((o) => o.id === optionId) ?? d.options[0];
     this.decision = null;
@@ -1681,22 +2070,59 @@ export class MatchEngine {
       case 'pass_short':
       case 'pass_through':
       case 'pass_long':
+      case 'pass_to':
       case 'cross': {
         const t = opt.data!.target!;
         this.stats.passes++;
-        const cross = opt.id === 'cross';
+        const tn = this.n(u.team, t.x, t.y);
+        const un = this.n(u.team, u.x, u.y);
+        const cross = opt.id === 'cross' || (opt.id === 'pass_to' && tn.x > HL - 17 && Math.abs(tn.y) < 18 && Math.abs(un.y) > 14 && un.x > 20);
+        const lofted = opt.id === 'pass_long' || (opt.id === 'pass_to' && !!opt.data?.lofted);
+        const resKey = opt.id === 'pass_to' ? (cross ? 'cross' : lofted ? 'pass_long' : 'pass_short') : opt.id;
         if (ok) {
           this.stats.passesOk++;
-          this.ratingAcc += opt.id === 'pass_short' ? 0.015 : 0.08;
-          this.pass(u, t, { protect: true, userPass: true, lofted: opt.id === 'pass_long', cross });
-          this.push(`res.${opt.id}.ok`, 'good');
+          const gain = tn.x - un.x;
+          this.ratingAcc += opt.id === 'pass_short' ? 0.015 : opt.id === 'pass_to' ? clamp(0.01 + gain * 0.006, 0, 0.14) : 0.08;
+          this.pass(u, t, { protect: true, userPass: true, lofted, cross });
+          this.push(`res.${resKey}.ok`, 'good');
         } else {
           const interceptor = this.nearestOpp(t, (u.x + t.x) / 2, (u.y + t.y) / 2).agent;
           this.ratingAcc -= 0.12;
-          this.pass(u, t, { interceptor, userPass: true, lofted: opt.id === 'pass_long', cross });
-          this.push(`res.${opt.id}.bad`, 'bad');
+          this.pass(u, t, { interceptor, userPass: true, lofted, cross });
+          this.push(`res.${resKey}.bad`, 'bad');
         }
         return !!ok;
+      }
+      case 'cross_near':
+      case 'cross_far':
+      case 'cross_spot': {
+        const t = opt.data!.target!;
+        const z = opt.data!.zone!;
+        this.stats.passes++;
+        if (ok) {
+          this.stats.passesOk++;
+          this.ratingAcc += 0.08;
+          this.pass(u, t, { protect: true, userPass: true, cross: true, lead: z });
+          this.push('res.cross.ok', 'good');
+        } else {
+          const interceptor = this.nearestOpp(t, z.x, z.y).agent;
+          this.ratingAcc -= 0.08;
+          this.pass(u, t, { interceptor, userPass: true, cross: true, lead: z });
+          this.push('res.cross.bad', 'bad');
+        }
+        return !!ok;
+      }
+      case 'fk_shot': {
+        this.stats.shots++;
+        const r = Math.random();
+        const m = this.shotModel(u, 'finesse');
+        const out = r < opt.chance ? 'goal' : r < opt.chance + (m.onTarget - m.goal) * 0.8 ? 'save' : 'miss';
+        this.shoot(u, 'finesse', out);
+        if (out !== 'miss') this.stats.shotsOn++;
+        this.ratingAcc += out === 'save' ? 0.04 : out === 'miss' ? -0.06 : 0;
+        this.push(`res.shot.${out}`, out === 'goal' ? 'goal' : out === 'save' ? 'info' : 'bad');
+        this.slowmo = 1.6;
+        return out === 'goal';
       }
       // ---------------- dribbles
       case 'dribble':
@@ -1743,16 +2169,7 @@ export class MatchEngine {
           this.ratingAcc += 0.08;
           if (Math.random() < 0.5) {
             this.push('res.shield.foul', 'good');
-            this.restart('freekick', u.team, u.x, u.y);
-            // make sure the user takes it
-            const b = this.ball;
-            if (b.owner && b.owner !== u) {
-              b.owner.x -= fwd * 2;
-              u.x = b.x;
-              u.y = b.y;
-              this.giveBall(u, true);
-            }
-            u.decideCd = 99;
+            this.restart('freekick', u.team, u.x, u.y, u);
           } else {
             this.push('res.shield.ok', 'good');
             this.userProtect = 1;

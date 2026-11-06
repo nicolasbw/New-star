@@ -555,6 +555,15 @@ export class MatchRenderer {
       pitch = -0.08 + k * 0.15;
       twist = 0.25 - k * 0.5;
     }
+    // throw-in: ball held over the head, then both arms whip forward
+    if (a.holdUp || a.throwAnim > 0) {
+      const k = a.holdUp ? 0 : 1 - a.throwAnim / 0.35;
+      armL = armR = -2.95 + k * 1.9;
+      armZ = 0.12;
+      elbow = a.holdUp ? 0.7 : 0.7 * (1 - k);
+      pitch = a.holdUp ? -0.12 : -0.12 + k * 0.35;
+      twist = 0;
+    }
     if (a.celebrate > 0) {
       armZ = 2.6;
       armL = armR = 0;
@@ -622,6 +631,14 @@ export class MatchRenderer {
     this.camera.position.set(this.camX, height, lookZ + dist);
     this.camera.lookAt(this.camX, 0, lookZ + (wantFocus ? 0 : portrait ? 7 : -2));
     this.renderer.render(this.scene, this.camera);
+  }
+
+  /** Screen position (CSS px) above an agent's head. */
+  screenOf(a: Agent, h = 2.6): { x: number; y: number } | null {
+    const v = new THREE.Vector3(a.x, h, a.y).project(this.camera);
+    if (v.z > 1) return null;
+    const el = this.renderer.domElement;
+    return { x: ((v.x + 1) / 2) * el.clientWidth, y: ((1 - v.y) / 2) * el.clientHeight };
   }
 
   /** Screen position (CSS px) of the user's head, for the name tag. */

@@ -10,12 +10,14 @@ const ICONS: Record<string, string> = {
   pass_long: '🛫', cross: '↪️', dribble: '🌀', elastico: '🐍', chapeu: '🎩', sprint: '⚡', shield: '🛡️',
   carry: '🏃', header: '🗣️', volley: '🦵', bicycle: '🚲', chest: '🫁', ask_ball: '🙋', run_behind: '🏁',
   box_run: '📦', hold_pos: '📍', tackle: '🦶', press: '🔥', slide: '🛷', cut_lane: '✂️',
+  cross_near: '↗️', cross_far: '↪️', cross_spot: '🎯', fk_shot: '🌪️',
 };
 
 const SPEEDS = [1, 2, 4];
 
 export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchReport) => void) {
   const engine = new MatchEngine(setup);
+  if (import.meta.env.DEV) (window as unknown as { __ns: MatchEngine }).__ns = engine;
   root.innerHTML = `
   <div class="match">
     <div class="m-canvas"></div>
@@ -33,6 +35,7 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
       </div>
     </div>
     <div class="m-feed" id="m-feed"></div>
+    <div class="m-targets" id="m-targets"></div>
     <div class="m-tag" id="m-tag">${esc(setup.user?.name.split(' ').slice(-1)[0] ?? '')}</div>
     <div class="m-status" id="m-status"></div>
     <div class="m-decision hidden" id="m-decision"></div>
@@ -65,15 +68,50 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
   };
   window.addEventListener('keydown', keyHandler);
 
-  function choose(id: string) {
+  function choose(id: string, targetId?: number) {
     if (!engine.decision) return;
-    engine.resolve(id);
+    engine.resolve(id, targetId);
     hideDecision();
   }
 
   function hideDecision() {
     shownDecision = null;
     $('m-decision').classList.add('hidden');
+    $('m-targets').innerHTML = '';
+    targetEls = [];
+  }
+
+  let targetEls: Array<{ el: HTMLElement; id: number }> = [];
+  function showTargets() {
+    const d = engine.decision!;
+    const wrap = $('m-targets');
+    wrap.innerHTML = '';
+    targetEls = d.targets.map((tg) => {
+      const el = document.createElement('button');
+      const pct = Math.round(tg.chance * 100);
+      const tone = pct >= 70 ? 'hi' : pct >= 45 ? 'mid' : 'lo';
+      el.className = `tgt ${tone}`;
+      el.innerHTML = `<b>${pct}%</b><span>${esc(tg.agent.name)}</span>`;
+      el.onclick = (e) => {
+        e.stopPropagation();
+        choose('pass_to', tg.agent.id);
+      };
+      wrap.appendChild(el);
+      return { el, id: tg.agent.id };
+    });
+  }
+
+  function placeTargets() {
+    for (const t of targetEls) {
+      const a = engine.agents.find((x) => x.id === t.id)!;
+      const pos = renderer.screenOf(a, 2.7);
+      if (!pos) {
+        t.el.style.display = 'none';
+        continue;
+      }
+      t.el.style.display = '';
+      t.el.style.transform = `translate(${pos.x}px, ${pos.y}px) translate(-50%, -100%)`;
+    }
   }
 
   function showDecision() {
@@ -83,8 +121,10 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
     el.classList.remove('hidden');
     el.className = `m-decision kind-${d.kind}`;
     el.innerHTML = `
-      <div class="dec-head"><span>${t(`dec.${d.kind}`)}</span><div class="dec-timer"><i id="dec-bar"></i></div></div>
+      <div class="dec-head"><span>${t(d.setPiece ? `dec.sp.${d.setPiece}` : `dec.${d.kind}`)}</span><div class="dec-timer"><i id="dec-bar"></i></div></div>
+      ${d.targets.length ? `<div class="dec-hint">👆 ${t('dec.tap_mate')}</div>` : ''}
       <div class="dec-opts">${d.options.map((o, i) => optHtml(o, i)).join('')}</div>`;
+    showTargets();
     el.querySelectorAll<HTMLButtonElement>('button[data-opt]').forEach((b) => {
       b.onclick = (e) => {
         e.stopPropagation();
@@ -167,6 +207,7 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
     if (!e.userOnField) return 6;
     if (e.decision) return 0.035;
     if (e.slowmo > 0) return 0.45;
+    if (e.phase === 'restart') return e.setPiece?.taker.isUser ? 1.2 : 1.8;
     if (e.phase !== 'play') return 1.3;
     const u = e.user!;
     const b = e.ball;
@@ -176,7 +217,7 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
 
   function frame(now: number) {
     raf = requestAnimationFrame(frame);
-    const dt = Math.min(0.1, (now - last) / 1000);
+    const dt = Math.max(0, Math.min(0.1, (now - last) / 1000));
     last = now;
     let simDt = 0;
     if (!ended) {
@@ -237,6 +278,7 @@ export function runMatch(root: HTMLElement, setup: MatchSetup, onEnd: (r: MatchR
       }
     }
     renderer.render(dt, engine.decision ? 'user' : 'none', simDt);
+    if (targetEls.length) placeTargets();
     const pos = renderer.userScreen();
     const tag = $('m-tag');
     if (pos) {

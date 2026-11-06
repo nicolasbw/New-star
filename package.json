@@ -11,7 +11,8 @@
     "test:sim": "tsx scripts/smarttest.ts 20 65 ST",
     "test:career": "tsx scripts/careertest.ts",
     "test:i18n": "tsx scripts/i18ncheck.ts",
-    "test:shape": "tsx scripts/shape.ts"
+    "test:shape": "tsx scripts/shape.ts",
+    "test:setpieces": "tsx scripts/setpieces.ts"
   },
   "dependencies": {
     "three": "^0.187.0"
