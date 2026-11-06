@@ -90,7 +90,14 @@ export class App {
         this.rerender();
         break;
       case 'new':
-        if (this.career && !confirm(t('menu.overwrite'))) return;
+        if (this.career && !this.career.retired) {
+          this.modal(`<p>${t('menu.overwrite')}</p><button class="btn primary" data-a="new-confirm">${t('common.continue')}</button><button class="btn ghost" data-a="close">${t('common.cancel')}</button>`);
+          return;
+        }
+        this.create();
+        break;
+      case 'new-confirm':
+        this.closeModal();
         this.create();
         break;
       case 'continue':
