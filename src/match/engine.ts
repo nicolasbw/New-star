@@ -74,6 +74,9 @@ export interface Agent {
   supY: number;
   diveT: number;
   touchAnim: number;
+  spT: number; // space-seeking refresh timer
+  spX: number; // chosen open spot (world)
+  spY: number;
   holdUp: boolean; // holding the ball over the head (throw-in)
   throwAnim: number;
 }
@@ -285,6 +288,8 @@ export class MatchEngine {
   private scheduled: Array<{ at: number; epoch: number; fn: () => void }> = [];
   private chasers: [Agent | null, Agent | null] = [null, null];
   private supporters: [Agent[], Agent[]] = [[], []];
+  /** Who has (or is about to receive) the ball, and where: attackers position around this point. */
+  private focus: { a: Agent; x: number; y: number } | null = null;
   setPiece: SetPiece | null = null;
   private userSetPiece: SetPieceKind | null = null;
   private runTimer: [number, number] = [2, 2];
@@ -339,6 +344,9 @@ export class MatchEngine {
           touchAnim: 0,
           holdUp: false,
           throwAnim: 0,
+          spT: 0,
+          spX: 0,
+          spY: 0,
         });
       });
     }
@@ -828,6 +836,8 @@ export class MatchEngine {
       this.kick(from, tx, ty, speed, 0.4);
     }
     this.dbg.passes++;
+    if (!opts.cross && !opts.throwIn && from.team === to.team) this.passAndMove(from);
+    for (const m of this.agents) if (m.team === from.team) m.spT = Math.min(m.spT, rand(0.05, 0.3));
     b.pass = {
       from,
       to,
@@ -849,7 +859,7 @@ export class MatchEngine {
     const ang = Math.abs(Math.atan2(nn.y, Math.max(0.5, HL - nn.x)));
     const pressure = this.nearestOpp(a).d;
     const gk = this.gk(a.team === 0 ? 1 : 0);
-    let base = 1.15 * Math.exp(-(Math.max(d, 5) - 5) / 10.5);
+    let base = 1.0 * Math.exp(-(Math.max(d, 5) - 5) / 10);
     const angleF = 1 - Math.min(0.75, ang / 1.35);
     const header = kind === 'header' || kind === 'bicycle' || kind === 'volley';
     const skillAttr = kind === 'header' ? this.eff(a, 'physical') * 0.5 + this.eff(a, 'shooting') * 0.5 : this.eff(a, 'shooting');
@@ -956,6 +966,7 @@ export class MatchEngine {
       a.celebrate = Math.max(0, a.celebrate - dt);
       a.react = Math.max(0, a.react - dt);
       a.supT -= dt;
+      a.spT -= dt;
       if (a.diveT > 0) {
         a.diveT -= dt;
         if (a.diveT <= 0) a.dive = 0;
@@ -1074,6 +1085,9 @@ export class MatchEngine {
 
   private computeRoles() {
     const b = this.ball;
+    if (b.owner) this.focus = { a: b.owner, x: b.owner.x, y: b.owner.y };
+    else if (b.pass && !b.shot) this.focus = { a: b.pass.to, x: b.pass.tx, y: b.pass.ty };
+    else this.focus = null;
     for (const team of [0, 1] as const) {
       let best: Agent | null = null;
       let bd = 1e9;
@@ -1095,13 +1109,15 @@ export class MatchEngine {
       this.chasers[team] = best;
       ps.sort((p, q) => p.d - q.d);
       this.pressers[team] = ps.slice(0, 2).map((p) => p.a);
-      // supporters: two nearest teammates offer passing angles to the carrier
-      const c = b.owner;
-      if (c && c.team === team && c.role !== 'GK') {
+      // supporters: the nearest teammates offer passing angles to the carrier (or the receiver of a pass in flight)
+      const f = this.focus;
+      const c = f?.a;
+      if (f && c && c.team === team && c.role !== 'GK') {
         this.supporters[team] = ps
+          .map((p) => ({ a: p.a, d: dist(p.a.x, p.a.y, f.x, f.y) }))
           .filter((p) => p.a !== c && !p.a.aiRun && !p.a.runTo && p.d < 30 && !(p.a.isUser && this.decision))
           .sort((p, q) => p.d - (p.a.isUser ? 8 : 0) - (q.d - (q.a.isUser ? 8 : 0)))
-          .slice(0, 2)
+          .slice(0, 3)
           .map((p) => p.a);
       } else this.supporters[team] = [];
     }
@@ -1146,6 +1162,100 @@ export class MatchEngine {
       const w = this.n(team, o.x, o.y);
       o.a.aiRun = { x: w.x, y: w.y, t: o.t };
     }
+  }
+
+  /**
+   * Space seeking: scores candidate spots around the player's anchor (neutral frame) by
+   * time advantage over opponents, an open passing lane from the carrier, progress,
+   * staying onside and not crowding teammates.
+   */
+  private spaceSpot(a: Agent, ax: number, ay: number, cx: number, cy: number, support = false) {
+    if (a.spT > 0) return { x: a.spX, y: a.spY };
+    a.spT = rand(0.55, 0.85);
+    const team = a.team;
+    const cn = this.n(team, cx, cy);
+    const c = this.focus!.a;
+    const line = this.oppLine(team);
+    const opps: Array<{ x: number; y: number; v: number }> = [];
+    for (const o of this.agents) {
+      if (o.team === team || o.sentOff) continue;
+      const p = this.n(team, o.x, o.y);
+      opps.push({ x: p.x, y: p.y, v: this.maxSpeed(o) });
+    }
+    const mates: Array<{ x: number; y: number }> = [];
+    for (const m of this.agents) {
+      if (m.team !== team || m === a || m === c || m.sentOff || m.role === 'GK') continue;
+      mates.push(m.spT > 0 ? this.n(team, m.spX, m.spY) : this.n(team, m.x, m.y));
+    }
+    const me = this.n(team, a.x, a.y);
+    const v = this.maxSpeed(a);
+    const cand: Array<[number, number]> = [];
+    if (support) {
+      // a ring around the carrier, mostly ahead and to the sides
+      for (const r of [9, 13, 17])
+        for (const ang of [-1.25, -0.8, -0.4, 0, 0.4, 0.8, 1.25, 2.1, -2.1]) cand.push([cn.x + Math.cos(ang) * r, cn.y + Math.sin(ang) * r]);
+      ax = me.x * 0.5 + ax * 0.5;
+      ay = me.y * 0.5 + ay * 0.5;
+    } else {
+      cand.push([ax, ay], [ax + 14, ay], [ax + 9, ay * 0.7]);
+      for (const r of [5, 10]) for (let k = 0; k < 8; k++) cand.push([ax + Math.cos((k * Math.PI) / 4) * r, ay + Math.sin((k * Math.PI) / 4) * r]);
+    }
+    let best = { x: ax, y: ay, s: -1e9 };
+    for (const [x0, y0] of cand) {
+      const x = clamp(x0, -HL + 3, HL - 2);
+      const y = clamp(y0, -HW + 1.5, HW - 1.5);
+      const myT = dist(me.x, me.y, x, y) / v;
+      let adv = 3;
+      let lane = 6;
+      for (const o of opps) {
+        adv = Math.min(adv, dist(o.x, o.y, x, y) / o.v - myT * 0.5);
+        lane = Math.min(lane, segDist(o.x, o.y, cn.x, cn.y, x, y));
+      }
+      const dc = dist(cn.x, cn.y, x, y);
+      let sc = clamp(adv, -1, 2.5) * 1.8 + Math.min(lane, 4) * 1.8;
+      if (lane < 1.7) sc -= 5;
+      sc += (x - cn.x) * 0.12 + (x - ax) * 0.05;
+      if (dc < 7) sc -= (7 - dc) * 0.8;
+      else if (dc > 24) sc -= (dc - 24) * 0.3;
+      if (x > line + 0.3 && x > cn.x) sc -= 8; // offside
+      for (const m of mates) {
+        const d = dist(m.x, m.y, x, y);
+        if (d < 8) sc -= (8 - d) * 0.7;
+      }
+      sc -= dist(x, y, ax, ay) * (support ? 0.08 : 0.14);
+      if (support && dc >= 7 && dc <= 18) sc += 1.5;
+      if (sc > best.s) best = { x, y, s: sc };
+    }
+    const w = this.n(team, best.x, best.y);
+    a.spX = w.x;
+    a.spY = w.y;
+    return w;
+  }
+
+  /** Pass and move: after playing the ball, the passer runs into space ahead (give-and-go). */
+  private passAndMove(from: Agent) {
+    if (from.isUser || from.role === 'GK') return;
+    const fn = this.n(from.team, from.x, from.y);
+    if (fn.x < -35 || fn.x > HL - 12) return;
+    const p = from.role === 'DEF' ? (Math.abs(from.by) > 15 ? 0.45 : 0.12) : from.role === 'MID' ? 0.6 : 0.5;
+    if (Math.random() > p) return;
+    const line = this.oppLine(from.team);
+    let best: { x: number; y: number; s: number } | null = null;
+    for (const [dx, dy] of [[12, 0], [11, 7], [11, -7], [14, fn.y > 0 ? -5 : 5], [8, fn.y > 0 ? -9 : 9]]) {
+      const x = clamp(Math.min(fn.x + dx, line + (dx > 12 ? 4 : 0.5)), -HL + 3, HL - 6);
+      const y = clamp(fn.y + dy, -HW + 2, HW - 2);
+      let open = 9;
+      for (const o of this.agents) {
+        if (o.team === from.team || o.sentOff) continue;
+        const q = this.n(from.team, o.x, o.y);
+        open = Math.min(open, dist(q.x, q.y, x, y));
+      }
+      const sc = open + Math.random() * 2;
+      if (!best || sc > best.s) best = { x, y, s: sc };
+    }
+    if (!best) return;
+    const w = this.n(from.team, best.x, best.y);
+    from.aiRun = { x: w.x, y: w.y, t: 2.1 };
   }
 
   /** Best open spot around the carrier for a supporting player. */
@@ -1219,8 +1329,10 @@ export class MatchEngine {
         return { x: c.x + (own - c.x) * k, y: c.y - c.y * k, sprint: true };
       }
       if (ps[1] === a && dist(a.x, a.y, c.x, c.y) < 16) {
-        const k = 2.5 / (dist(c.x, c.y, own, 0) || 1);
-        return { x: c.x + (own - c.x) * k, y: c.y - c.y * k, sprint: true };
+        // the second man doubles up only near our goal; in midfield he screens the passing lane
+        const deep = this.n(a.team, c.x, c.y).x < -8;
+        const k = (deep ? 2.5 : 6) / (dist(c.x, c.y, own, 0) || 1);
+        return { x: c.x + (own - c.x) * k, y: c.y - c.y * k, sprint: deep };
       }
     }
 
@@ -1236,14 +1348,7 @@ export class MatchEngine {
     }
 
     // tactical runs and support play (attacking)
-    if (this.phase === 'play' && att) {
-      if (a.aiRun) return { x: a.aiRun.x, y: a.aiRun.y, sprint: true };
-      const c = b.owner;
-      if (c && c !== a && this.supporters[a.team].includes(a)) {
-        const sp = this.supportSpot(a, c);
-        return { x: sp.x, y: sp.y, sprint: dist(a.x, a.y, sp.x, sp.y) > 6 };
-      }
-    }
+    if (this.phase === 'play' && att && a.aiRun) return { x: a.aiRun.x, y: a.aiRun.y, sprint: true };
 
     // formation: a compact block, each line follows the ball at its own distance
     const bx = nb.x;
@@ -1251,9 +1356,10 @@ export class MatchEngine {
     let midLine: number;
     let fwdLine: number;
     if (att) {
-      defLine = clamp(bx - 27, -40, 14);
-      midLine = clamp(bx - 7.5, -30, 31);
-      fwdLine = clamp(bx + 8, -10, 46);
+      defLine = clamp(bx - 26, -40, 16);
+      midLine = clamp(bx - 5, -30, 33);
+      // forwards pin the opponents' back line
+      fwdLine = clamp(Math.max(bx + 8, Math.min(this.oppLine(a.team) - 0.8, bx + 24)), -10, 46);
     } else {
       defLine = clamp(bx - 15, -45, -6);
       midLine = clamp(bx - 6, -37, 10);
@@ -1276,6 +1382,13 @@ export class MatchEngine {
     const pull = att ? 0.22 : 0.42;
     let ty = a.by * width + nb.y * pull + a.jitterY;
     ty = clamp(ty, -HW + 1.5, HW - 1.5);
+    // in possession: find the best open spot around the tactical anchor (centre-backs hold the rest defence)
+    const f = this.focus;
+    if (this.phase === 'play' && att && f && f.a.team === a.team && f.a !== a && f.a.role !== 'GK' && !(a.role === 'DEF' && !wide)) {
+      // the nearest players offer short angles around the ball (triangles), the rest give width and depth
+      const spot = this.spaceSpot(a, tx, ty, f.x, f.y, this.supporters[a.team].includes(a));
+      return { x: spot.x, y: spot.y, sprint: dist(a.x, a.y, spot.x, spot.y) > 4 };
+    }
     if (this.phase === 'restart' && sp && sp.team !== a.team) {
       const w0 = this.n(a.team, tx, ty);
       const d = dist(w0.x, w0.y, sp.x, sp.y);
@@ -1333,7 +1446,7 @@ export class MatchEngine {
       } else {
         if (a.react <= 0 || this.phase !== 'play') {
           const t = this.target(a);
-          const k = 1 - Math.exp(-dt * (t.sprint ? 9 : 3.2));
+          const k = 1 - Math.exp(-dt * (t.sprint ? 9 : this.possession === a.team ? 5 : 3.2));
           if (dist(a.tgtX, a.tgtY, t.x, t.y) > 25) {
             a.tgtX = t.x;
             a.tgtY = t.y;
